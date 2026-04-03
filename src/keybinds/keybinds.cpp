@@ -4,11 +4,14 @@
 #include "pyunrealsdk/logging.h"
 #include "pyunrealsdk/static_py_object.h"
 #include "pyunrealsdk/unreal_bindings/uenum.h"
+#include "unrealsdk/config.h"
+#include "unrealsdk/game/bl4/bl4.h"
 #include "unrealsdk/memory.h"
 #include "unrealsdk/unreal/class_name.h"
 #include "unrealsdk/unreal/classes/uenum.h"
 #include "unrealsdk/unreal/classes/uobject.h"
 #include "unrealsdk/unreal/classes/uobject_funcs.h"
+#include "unrealsdk/unreal/find_class.h"
 #include "unrealsdk/unreal/properties/zboolproperty.h"
 #include "unrealsdk/unreal/structs/fname.h"
 #include "unrealsdk/unrealsdk.h"
@@ -150,25 +153,6 @@ using playerinput_inputkey_func = uintptr_t (*)(UGbxEnhancedPlayerInput* self,
                                                 FInputKeyParams* params);
 playerinput_inputkey_func playerinput_inputkey_ptr;
 
-const constinit Pattern<57> PLAYERINPUT_INPUTKEY_PATTERN{
-    "41 57"                // push r15
-    "41 56"                // push r14
-    "41 54"                // push r12
-    "56"                   // push rsi
-    "57"                   // push rdi
-    "55"                   // push rbp
-    "53"                   // push rbx
-    "48 81 EC ????????"    // sub rsp, 000000A0
-    "0F29 BC 24 ????????"  // movaps [rsp+00000090], xmm7
-    "0F29 B4 24 ????????"  // movaps [rsp+00000080], xmm6
-    "48 89 D7"             // mov rdi, rdx
-    "48 89 CE"             // mov rsi, rcx
-    "48 8B 05 ????????"    // mov rax, [Borderlands4.exe+C499940]
-    "48 31 E0"             // xor rax, rsp
-    "48 89 44 24 ??"       // mov [rsp+78], rax
-    "48 89 D1"             // mov rcx, rdx
-};
-
 uintptr_t playerinput_inputkey_hook(UGbxEnhancedPlayerInput* self, FInputKeyParams* params) {
     try {
         if (handle_key_event(self, params)) {
@@ -186,8 +170,18 @@ uintptr_t playerinput_inputkey_hook(UGbxEnhancedPlayerInput* self, FInputKeyPara
 
 // NOLINTNEXTLINE(readability-identifier-length)
 PYBIND11_MODULE(keybinds, m) {
-    detour(PLAYERINPUT_INPUTKEY_PATTERN.sigscan_nullable(), playerinput_inputkey_hook,
-           &playerinput_inputkey_ptr, "UGbxEnhancedPlayerInput::InputKey");
+    const auto idx =
+        unrealsdk::config::get_int<size_t>("oak2_keybinds.input_key_vf_index").value_or(85);
+    auto func_ptr = unrealsdk::unreal::find_class(L"GbxEnhancedPlayerInput")
+                        ->ClassDefaultObject()
+                        ->vftable[idx];
+
+    // This function is has previously been slow to unpack. We might be ok now, because we're
+    // delayed until console's ready, which also has a slow detour, but might as well still use this
+    // to be safe
+    unrealsdk::game::bl4::detour_once_executable(func_ptr, playerinput_inputkey_hook,
+                                                 &playerinput_inputkey_ptr,
+                                                 "UGbxEnhancedPlayerInput::InputKey");
 
     m.def(
         "register_keybind",
