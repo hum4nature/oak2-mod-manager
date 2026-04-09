@@ -1,0 +1,331 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{6F885915-E3BE-4478-AC09-25EF80373686}</ProjectGuid>
+    <RootNamespace>Borderlands4</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+    <Import Project="$(VCTargetsPath)\BuildCustomizations\masm.props" />
+  </ImportGroup>
+  <ImportGroup Label="Shared">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <PreprocessorDefinitions>WIN32;_DEBUG;BL4_DEBUG_BUILD=1;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpplatest</LanguageStandard>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)ThirdParty;$(ProjectDir)ThirdParty\ImGui;$(ProjectDir)ThirdParty\ImGui\backends;$(ProjectDir)ThirdParty\MinHook\include;$(ProjectDir)ThirdParty\SDK;$(ProjectDir)ThirdParty\SDK\SDK;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>true</SDLCheck>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <PreprocessorDefinitions>WIN32;NDEBUG;BL4_DEBUG_BUILD=0;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpplatest</LanguageStandard>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)ThirdParty;$(ProjectDir)ThirdParty\ImGui;$(ProjectDir)ThirdParty\ImGui\backends;$(ProjectDir)ThirdParty\MinHook\include;$(ProjectDir)ThirdParty\SDK;$(ProjectDir)ThirdParty\SDK\SDK;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <PreprocessorDefinitions>_DEBUG;BL4_DEBUG_BUILD=1;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpplatest</LanguageStandard>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)ThirdParty;$(ProjectDir)ThirdParty\ImGui;$(ProjectDir)ThirdParty\ImGui\backends;$(ProjectDir)ThirdParty\MinHook\include;$(ProjectDir)ThirdParty\SDK;$(ProjectDir)ThirdParty\SDK\SDK;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>/utf-8</AdditionalOptions>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <OmitFramePointers>true</OmitFramePointers>
+      <SDLCheck>true</SDLCheck>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <PreprocessorDefinitions>NDEBUG;BL4_DEBUG_BUILD=0;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpplatest</LanguageStandard>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)ThirdParty;$(ProjectDir)ThirdParty\ImGui;$(ProjectDir)ThirdParty\ImGui\backends;$(ProjectDir)ThirdParty\MinHook\include;$(ProjectDir)ThirdParty\SDK;$(ProjectDir)ThirdParty\SDK\SDK;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+      <AdditionalOptions>/utf-8</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>false</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="Core\Config\ConfigManager.cpp" />
+    <ClCompile Include="Core\Framework\Scheduler.cpp" />
+    <ClCompile Include="Core\Framework\Variables.cpp" />
+    <ClCompile Include="Core\Framework\Utils.cpp" />
+    <ClCompile Include="Core\Hooks\D3D12Hook.cpp" />
+    <ClCompile Include="Core\Hooks\EngineHooks.cpp" />
+    <ClCompile Include="Core\Hooks\Init.cpp" />
+    <ClCompile Include="Core\Hooks\ProcessEventHook.cpp" />
+    <ClCompile Include="Core\Hooks\StealthHook.cpp" />
+    <ClCompile Include="Core\Memory\Memory.cpp" />
+    <ClCompile Include="Core\Memory\SignatureRegistry.cpp" />
+    <ClCompile Include="Core\Security\AntiDebug.cpp" />
+    <ClCompile Include="Core\Services\Hotkey\Hotkey.cpp" />
+    <ClCompile Include="Core\Services\Interop\NativeInterop.cpp" />
+    <ClCompile Include="Core\Services\Localization\Localization.cpp" />
+    <ClCompile Include="Core\Services\Logger\Logger.cpp" />
+    <ClCompile Include="DLLMain.cpp" />
+    <ClCompile Include="Features\Aimbot\AimbotFeature.cpp" />
+    <ClCompile Include="Features\Data\EnabledOptionsFeature.cpp" />
+    <ClCompile Include="Features\Core\FeatureRegistry.cpp" />
+    <ClCompile Include="Features\Camera\CameraFeature.cpp" />
+    <ClCompile Include="Features\Debug\DebugFeature.cpp" />
+    <ClCompile Include="Features\ESP\ESPFeature.cpp" />
+    <ClCompile Include="Features\Movement\MovementFeature.cpp" />
+    <ClCompile Include="Features\Player\PersistenceFeature.cpp" />
+    <ClCompile Include="Features\Player\PlayerFeature.cpp" />
+    <ClCompile Include="Features\Weapon\WeaponFeature.cpp" />
+    <ClCompile Include="Features\Weapon\TriggerFeature.cpp" />
+    <ClCompile Include="Features\Weapon\ReticleFeature.cpp" />
+    <ClCompile Include="Features\World\WorldFeature.cpp" />
+    <ClCompile Include="Interface\Fonts\Embedded\EmbeddedFontFallback.cpp" />
+    <ClCompile Include="Interface\Fonts\Embedded\EmbeddedFontMain.cpp" />
+    <ClCompile Include="Interface\Menu\Menu.cpp" />
+    <ClCompile Include="Interface\Overlay\BackdropBlur.cpp" />
+    <ClCompile Include="Interface\Drawing\Draw.cpp" />
+    <ClCompile Include="Interface\Overlay\Overlay.cpp" />
+    <ClCompile Include="Interface\Theme\Themes.cpp" />
+    <ClCompile Include="pch.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Create</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">Create</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Create</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="ThirdParty\ImGui\backends\imgui_impl_dx12.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="ThirdParty\ImGui\backends\imgui_impl_win32.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="ThirdParty\ImGui\imgui.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="ThirdParty\ImGui\imgui_demo.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="ThirdParty\ImGui\imgui_draw.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="ThirdParty\ImGui\imgui_tables.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="ThirdParty\ImGui\imgui_widgets.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="ThirdParty\ImGui\misc\cpp\imgui_stdlib.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="ThirdParty\MinHook\src\buffer.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="ThirdParty\MinHook\src\hde\hde32.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="ThirdParty\MinHook\src\hde\hde64.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="ThirdParty\MinHook\src\hook.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="ThirdParty\MinHook\src\trampoline.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="ThirdParty\SDK\SDK\Basic.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="ThirdParty\SDK\SDK\CoreUObject_functions.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="ThirdParty\SDK\SDK\Engine_functions.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="ThirdParty\SDK\SDK\OakGame_functions.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="ThirdParty\SDK\SDK\GbxGame_functions.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="ThirdParty\SDK\SDK\GbxWeapon_functions.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="ThirdParty\SDK\SDK\GbxAI_functions.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="ThirdParty\SDK\SDK\AIModule_functions.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="ThirdParty\SDK\SDK\TemplateSequence_functions.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="Core\Config\ConfigManager.h" />
+    <ClInclude Include="Core\Framework\Scheduler.h" />
+    <ClInclude Include="Core\Framework\Variables.h" />
+    <ClInclude Include="Core\Framework\Utils.h" />
+    <ClInclude Include="Core\Hooks\D3D12Hook.h" />
+    <ClInclude Include="Core\Hooks\EngineHooks.h" />
+    <ClInclude Include="Core\Hooks\StealthHook.h" />
+    <ClInclude Include="Core\Memory\Memory.h" />
+    <ClInclude Include="Core\Memory\SignatureRegistry.h" />
+    <ClInclude Include="Core\Security\AntiDebug.h" />
+    <ClInclude Include="Core\Services\Hotkey\Hotkey.h" />
+    <ClInclude Include="Core\Services\Interop\NativeInterop.h" />
+    <ClInclude Include="Core\Services\Localization\Localization.h" />
+    <ClInclude Include="Core\Services\Logger\Logger.h" />
+    <ClInclude Include="Features\Aimbot\AimbotFeature.h" />
+    <ClInclude Include="Features\Camera\CameraFeature.h" />
+    <ClInclude Include="Features\Debug\DebugFeature.h" />
+    <ClInclude Include="Features\Data\FeatureData.h" />
+    <ClInclude Include="Features\Core\FeatureRegistry.h" />
+    <ClInclude Include="Features\Movement\MovementFeature.h" />
+    <ClInclude Include="Features\Player\PlayerFeature.h" />
+    <ClInclude Include="Features\Weapon\WeaponFeature.h" />
+    <ClInclude Include="Features\World\WorldFeature.h" />
+    <ClInclude Include="Interface\Fonts\Embedded\EmbeddedFontFallback.h" />
+    <ClInclude Include="Interface\Fonts\Embedded\EmbeddedFontMain.h" />
+    <ClInclude Include="Interface\Menu\Menu.h" />
+    <ClInclude Include="Interface\Overlay\BackdropBlur.h" />
+    <ClInclude Include="Interface\Drawing\Draw.h" />
+    <ClInclude Include="Interface\Overlay\Overlay.h" />
+    <ClInclude Include="Interface\Theme\Themes.h" />
+    <ClInclude Include="pch.h" />
+    <ClInclude Include="ThirdParty\SDK\SDK.hpp" />
+    <ClInclude Include="ThirdParty\SDK\SDK\Basic.hpp" />
+    <ClInclude Include="ThirdParty\SDK\SDK\CoreUObject_classes.hpp" />
+    <ClInclude Include="ThirdParty\SDK\SDK\CoreUObject_structs.hpp" />
+    <ClInclude Include="ThirdParty\SDK\SDK\CoreUObject_parameters.hpp" />
+    <ClInclude Include="ThirdParty\SDK\SDK\Engine_classes.hpp" />
+    <ClInclude Include="ThirdParty\SDK\SDK\Engine_structs.hpp" />
+    <ClInclude Include="ThirdParty\SDK\SDK\Engine_parameters.hpp" />
+    <ClInclude Include="ThirdParty\SDK\SDK\OakGame_classes.hpp" />
+    <ClInclude Include="ThirdParty\SDK\SDK\OakGame_structs.hpp" />
+    <ClInclude Include="ThirdParty\SDK\SDK\OakGame_parameters.hpp" />
+    <ClInclude Include="ThirdParty\SDK\SDK\GbxGame_classes.hpp" />
+    <ClInclude Include="ThirdParty\SDK\SDK\GbxGame_structs.hpp" />
+    <ClInclude Include="ThirdParty\SDK\SDK\GbxGame_parameters.hpp" />
+    <ClInclude Include="ThirdParty\SDK\SDK\GbxWeapon_classes.hpp" />
+    <ClInclude Include="ThirdParty\SDK\SDK\GbxWeapon_structs.hpp" />
+    <ClInclude Include="ThirdParty\SDK\SDK\GbxWeapon_parameters.hpp" />
+    <ClInclude Include="ThirdParty\SDK\SDK\GbxAI_classes.hpp" />
+    <ClInclude Include="ThirdParty\SDK\SDK\GbxAI_structs.hpp" />
+    <ClInclude Include="ThirdParty\SDK\SDK\GbxAI_parameters.hpp" />
+    <ClInclude Include="ThirdParty\SDK\SDK\AIModule_classes.hpp" />
+    <ClInclude Include="ThirdParty\SDK\SDK\AIModule_structs.hpp" />
+    <ClInclude Include="ThirdParty\SDK\SDK\AIModule_parameters.hpp" />
+    <ClInclude Include="ThirdParty\SDK\SDK\TemplateSequence_classes.hpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="ThirdParty\ImGui\misc\debuggers\imgui.natstepfilter" />
+  </ItemGroup>
+  <ItemGroup>
+    <Natvis Include="ThirdParty\ImGui\misc\debuggers\imgui.natvis" />
+  </ItemGroup>
+  <ItemGroup>
+    <MASM Include="Core\Hooks\StealthSyscall.asm" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+    <Import Project="$(VCTargetsPath)\BuildCustomizations\masm.targets" />
+  </ImportGroup>
+</Project>
