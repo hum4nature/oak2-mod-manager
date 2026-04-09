@@ -1,0 +1,23 @@
+{
+    "Camo": {
+        "name": "Shalashaska",
+        "item_type": "WEAPON",
+        "weapon_type": "PISTOL",
+        "manufacturer": "JAKOBS"
+    },
+    "Ice": {
+        "name": "Kill Spring",
+        "item_type": "REPKIT",
+        "manufacturer": "TEDIORE"
+    },
+    "Rainbow": {
+        "name": "Firewerks",
+        "item_type": "SHIELD",
+        "manufacturer": "TORGUE"
+    },
+    "Laser": {
+        "name": "Gamma Void",
+        "item_type": "HEAVY_ORDNANCE",
+        "manufacturer": "MALIWAN"
+    }
+}
