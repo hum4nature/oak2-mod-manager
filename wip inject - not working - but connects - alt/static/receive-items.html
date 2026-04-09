@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BL4 Receive Items</title>
+  <link rel="stylesheet" href="/receive-items.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div>
+        <h1>BL4 Receive Items</h1>
+        <p class="subtitle">Paste @U serials and inject them into your live backpack.</p>
+      </div>
+      <div class="status-grid">
+        <div class="status-pill" id="backendStatus">Backend: checking</div>
+        <div class="status-pill" id="gameStatus">Game: unknown</div>
+        <div class="status-pill" id="backpackStatus">Backpack: unknown</div>
+      </div>
+    </header>
+
+    <main class="content-grid">
+      <section class="panel">
+        <div class="panel-header">
+          <h2>Queued Serials</h2>
+          <span id="queueCount">0 items</span>
+        </div>
+        <div id="serialList" class="serial-list empty-state">
+          No serials queued yet.
+        </div>
+      </section>
+
+      <section class="panel controls-panel">
+        <div class="panel-header">
+          <h2>Add One Serial</h2>
+        </div>
+        <div class="control-group">
+          <label for="singleSerial">Single @U serial</label>
+          <input id="singleSerial" type="text" placeholder="@U..." spellcheck="false">
+        </div>
+        <div class="button-row">
+          <button id="addSingleButton" class="primary">Add</button>
+          <button id="deleteSelectedButton">Delete Selected</button>
+        </div>
+
+        <div class="panel-header secondary-header">
+          <h2>Add Many Serials</h2>
+        </div>
+        <div class="control-group">
+          <label for="batchSerials">Paste one @U serial per line</label>
+          <textarea id="batchSerials" rows="8" placeholder="@U...
+@U..." spellcheck="false"></textarea>
+        </div>
+        <div class="button-row">
+          <button id="addBatchButton" class="primary">Add Pasted Lines</button>
+          <button id="clearQueueButton">Clear Queue</button>
+        </div>
+
+        <div class="panel-header secondary-header">
+          <h2>Actions</h2>
+        </div>
+        <div class="button-grid">
+          <button id="attachButton" class="primary">Attach To Game</button>
+          <button id="injectSelectedButton" class="primary">Inject Selected</button>
+          <button id="injectAllButton" class="primary">Inject All</button>
+          <button id="refreshStatusButton">Refresh Status</button>
+        </div>
+      </section>
+
+      <section class="panel log-panel">
+        <div class="panel-header">
+          <h2>Activity Log</h2>
+        </div>
+        <div id="logList" class="log-list"></div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/receive-items.js"></script>
+</body>
+</html>
