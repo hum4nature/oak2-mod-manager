@@ -1,0 +1,288 @@
+<ResourceDictionary xmlns="https://github.com/avaloniaui"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:sys="clr-namespace:System;assembly=mscorlib">
+
+    <!-- Toolbar -->
+    <sys:String x:Key="str.Connect">Connect</sys:String>
+    <sys:String x:Key="str.Disconnect">Disconnect</sys:String>
+    <sys:String x:Key="str.Toolbar.AddressFormat">Address:</sys:String>
+    <sys:String x:Key="str.Toolbar.CollapsePointers">Collapse Pointer Nodes</sys:String>
+    <sys:String x:Key="str.Toolbar.ArrayLimit">Array Limit:</sys:String>
+    <sys:String x:Key="str.Toolbar.ArrayLimitWarn">⚠ High memory usage — may cause crash</sys:String>
+    <sys:String x:Key="str.Toolbar.DropDownLimit">DropDown Limit:</sys:String>
+    <sys:String x:Key="str.Toolbar.PreviewLimit">Preview:</sys:String>
+    <sys:String x:Key="str.Toolbar.CsxDepth">CSX Depth:</sys:String>
+
+    <!-- Tabs -->
+    <sys:String x:Key="str.Tab.ClassStruct">Class Structure</sys:String>
+    <sys:String x:Key="str.Tab.Pointers">Global Pointers</sys:String>
+    <sys:String x:Key="str.Tab.ProxyDeploy">Proxy Deploy</sys:String>
+    <sys:String x:Key="str.Tab.LiveWalker">Live Walker</sys:String>
+    <sys:String x:Key="str.Tab.InstanceFinder">Instance Finder</sys:String>
+    <sys:String x:Key="str.Tab.PropertySearch">Property Search</sys:String>
+    <sys:String x:Key="str.Tab.GameClassFilter">Game Classes</sys:String>
+
+    <!-- Object Tree -->
+    <sys:String x:Key="str.ObjectTree.Title">Object Tree</sys:String>
+    <sys:String x:Key="str.ObjectTree.Search">Search objects...</sys:String>
+    <sys:String x:Key="str.ObjectTree.Load">Load</sys:String>
+    <sys:String x:Key="str.ObjectTree.Reload">Reload</sys:String>
+    <sys:String x:Key="str.ObjectTree.Loading">Loading...</sys:String>
+    <sys:String x:Key="str.ObjectTree.Count">Objects: {0}</sys:String>
+    <sys:String x:Key="str.ObjectTree.CopyClassName">Copy Type</sys:String>
+    <sys:String x:Key="str.ObjectTree.CopyObjectName">Copy Name</sys:String>
+    <sys:String x:Key="str.ObjectTree.CopyAddress">Copy Address</sys:String>
+    <sys:String x:Key="str.ObjectTree.FilterHint">Filter loaded objects...</sys:String>
+    <sys:String x:Key="str.ObjectTree.ClassFilter">Class Type:</sys:String>
+    <sys:String x:Key="str.ObjectTree.Cancel">Cancel</sys:String>
+
+    <!-- Instance Finder -->
+    <sys:String x:Key="str.InstanceFinder.CopyAddress">Copy Address</sys:String>
+
+    <!-- Live Walker -->
+    <sys:String x:Key="str.LiveWalker.SearchHint">Search fields...</sys:String>
+    <sys:String x:Key="str.LiveWalker.SearchCount">{0} matches</sys:String>
+    <sys:String x:Key="str.LiveWalker.GenerateCeAA">Copy CE AA Script</sys:String>
+
+    <!-- Class Structure -->
+    <sys:String x:Key="str.ClassStruct.Name">Name</sys:String>
+    <sys:String x:Key="str.ClassStruct.Type">Type</sys:String>
+    <sys:String x:Key="str.ClassStruct.Offset">Offset</sys:String>
+    <sys:String x:Key="str.ClassStruct.Size">Size</sys:String>
+    <sys:String x:Key="str.ClassStruct.Super">Super Class</sys:String>
+    <sys:String x:Key="str.ClassStruct.PropsSize">Properties Size</sys:String>
+    <sys:String x:Key="str.ClassStruct.NoClass">Select an object to view its class structure</sys:String>
+
+    <!-- Live Walker -->
+    <sys:String x:Key="str.LiveWalker.StartWorld">Start from GWorld</sys:String>
+    <sys:String x:Key="str.LiveWalker.Back">Back</sys:String>
+    <sys:String x:Key="str.LiveWalker.Parent">Parent &#x2191;</sys:String>
+    <sys:String x:Key="str.LiveWalker.Refresh">Refresh</sys:String>
+    <sys:String x:Key="str.LiveWalker.AddressHint">Address (hex or module.exe+offset)</sys:String>
+    <sys:String x:Key="str.LiveWalker.Go">Go</sys:String>
+    <sys:String x:Key="str.LiveWalker.ExportCE">Copy CE XML</sys:String>
+    <sys:String x:Key="str.LiveWalker.ExportCEField">Copy CE Field</sys:String>
+    <sys:String x:Key="str.LiveWalker.AobToggle">AOB</sys:String>
+    <sys:String x:Key="str.LiveWalker.ExportCsx">Export CSX</sys:String>
+    <sys:String x:Key="str.LiveWalker.Value">Value</sys:String>
+    <sys:String x:Key="str.LiveWalker.CopyAddress">Addr</sys:String>
+    <sys:String x:Key="str.LiveWalker.CopyName">Name</sys:String>
+    <sys:String x:Key="str.LiveWalker.PtrValue">[Ptr]</sys:String>
+    <sys:String x:Key="str.LiveWalker.CopyPtr">Ptr</sys:String>
+    <sys:String x:Key="str.LiveWalker.AutoRefresh">Auto</sys:String>
+    <sys:String x:Key="str.LiveWalker.IntervalSec">sec</sys:String>
+    <sys:String x:Key="str.LiveWalker.Copy">Copy</sys:String>
+    <sys:String x:Key="str.LiveWalker.HexFieldTip">Navigate CE hex view to field address (via AOBMaker CE Plugin)</sys:String>
+    <sys:String x:Key="str.LiveWalker.HexPtrTip">Navigate CE hex view to pointer target (via AOBMaker CE Plugin)</sys:String>
+    <sys:String x:Key="str.LiveWalker.HexObjectTip">Navigate CE hex view to current object address (via AOBMaker CE Plugin)</sys:String>
+
+    <!-- Live Walker: Bookmarks -->
+    <sys:String x:Key="str.LiveWalker.BookmarkSave">&#x2605;</sys:String>
+    <sys:String x:Key="str.Tip.LiveWalker.BookmarkSave">Save current view to a bookmark slot</sys:String>
+    <sys:String x:Key="str.Tip.LiveWalker.BookmarkSaveActive">Click a bookmark slot to save, or click &#x2605; again to cancel</sys:String>
+    <sys:String x:Key="str.Tip.LiveWalker.BookmarkClear">Clear this bookmark</sys:String>
+    <sys:String x:Key="str.Tip.LiveWalker.BookmarkEmpty">Empty bookmark slot</sys:String>
+
+    <!-- Instance Finder -->
+    <sys:String x:Key="str.InstanceFinder.ClassNameHint">Class name (e.g. PlayerController)</sys:String>
+    <sys:String x:Key="str.InstanceFinder.Search">Search</sys:String>
+    <sys:String x:Key="str.InstanceFinder.Address">Address</sys:String>
+    <sys:String x:Key="str.InstanceFinder.OpenInWalker">Open in Live Walker</sys:String>
+    <sys:String x:Key="str.InstanceFinder.AddressHint">Address (hex or module.exe+offset)</sys:String>
+    <sys:String x:Key="str.InstanceFinder.Lookup">Lookup</sys:String>
+    <sys:String x:Key="str.InstanceFinder.ExactMatch">Exact match</sys:String>
+
+    <!-- Pointer Panel -->
+    <sys:String x:Key="str.Pointers.GObjects">GObjects Address</sys:String>
+    <sys:String x:Key="str.Pointers.GNames">GNames Address</sys:String>
+    <sys:String x:Key="str.Pointers.GWorld">GWorld Address</sys:String>
+    <sys:String x:Key="str.Pointers.UEVersion">UE Version</sys:String>
+    <sys:String x:Key="str.Pointers.TotalObjects">Total Objects</sys:String>
+    <sys:String x:Key="str.Pointers.Copy">Copy</sys:String>
+    <sys:String x:Key="str.Pointers.NotConnected">Not connected — connect to view pointers</sys:String>
+    <sys:String x:Key="str.Pointers.VersionWarning">&#x26A0; Version not detected — inferred from engine analysis (custom UE build?)</sys:String>
+    <sys:String x:Key="str.Pointers.AobFailed">&#x26A0; AOB failed — found via</sys:String>
+    <sys:String x:Key="str.Pointers.GWorldNotFound">GWorld not found (non-critical)</sys:String>
+    <sys:String x:Key="str.Pointers.PatternIdTooltip">AOB pattern ID that matched this pointer</sys:String>
+    <sys:String x:Key="str.Pointers.AobAllFailed">&#x1F534; All AOB patterns failed</sys:String>
+    <sys:String x:Key="str.Pointers.ExtraScan">Extra Scan</sys:String>
+    <sys:String x:Key="str.Pointers.ExtraScanHint">Some pointers not found. Try aggressive scanning techniques (5-20 seconds).</sys:String>
+    <sys:String x:Key="str.Pointers.AobMakerHex">HEX</sys:String>
+    <sys:String x:Key="str.Pointers.AobMakerHexTip">Navigate CE hex view to pointer address (via AOBMaker CE Plugin)</sys:String>
+    <sys:String x:Key="str.Pointers.AobMakerAsm">ASM</sys:String>
+    <sys:String x:Key="str.Pointers.AobMakerScanAsmTip">Navigate CE disassembler to AOB scan hit instruction (via AOBMaker CE Plugin)</sys:String>
+    <sys:String x:Key="str.Pointers.RegisterSymbol">SYM</sys:String>
+    <sys:String x:Key="str.Pointers.RegisterSymbolTip">Create CE AA Script that registers GWorld address as 'gworld_addr' symbol (via AOBMaker CE Plugin)</sys:String>
+    <sys:String x:Key="str.Pointers.TestExtraScan">Test Extra Scan</sys:String>
+    <sys:String x:Key="str.Pointers.TestExtraScanHint">Dev test: simulate scan progress UI (does not actually rescan).</sys:String>
+    <sys:String x:Key="str.Pointers.ClearGameCache">Clear This Game</sys:String>
+    <sys:String x:Key="str.Pointers.ResetAllCache">Reset All</sys:String>
+    <sys:String x:Key="str.Pointers.CacheHint">Scan hint cache — clear cached patterns to force a full re-scan.</sys:String>
+    <sys:String x:Key="str.Pointers.AobLabel">AOB:</sys:String>
+    <sys:String x:Key="str.Pointers.CopyScanAddr">Copy</sys:String>
+
+    <!-- Pointer Panel: Extra Scan status messages (code-behind via Res.Get) -->
+    <sys:String x:Key="str.Pointers.Scan.Starting">Starting scan...</sys:String>
+    <sys:String x:Key="str.Pointers.Scan.NothingToScan">Nothing to scan — all pointers found.</sys:String>
+    <sys:String x:Key="str.Pointers.Scan.Applying">Applying results...</sys:String>
+    <sys:String x:Key="str.Pointers.Scan.Applied">Scan complete — results applied.</sys:String>
+    <sys:String x:Key="str.Pointers.Scan.NoResults">No additional pointers found.</sys:String>
+    <sys:String x:Key="str.Pointers.Scan.CompleteNoResults">Scan complete — no results.</sys:String>
+    <sys:String x:Key="str.Pointers.Scan.Error">Scan error: {0}</sys:String>
+
+    <!-- Pointer Panel: Test Extra Scan status messages (code-behind via Res.Get) -->
+    <sys:String x:Key="str.Pointers.TestScan.Starting">Starting test scan...</sys:String>
+    <sys:String x:Key="str.Pointers.TestScan.GObjects">Scanning GObjects (.data heuristic)...</sys:String>
+    <sys:String x:Key="str.Pointers.TestScan.GWorld">Scanning GWorld (instance scan)...</sys:String>
+    <sys:String x:Key="str.Pointers.TestScan.Complete">Test scan complete.</sys:String>
+    <sys:String x:Key="str.Pointers.TestScan.Result">Test: scan simulation finished (no actual rescan — all pointers are already found).</sys:String>
+    <sys:String x:Key="str.Pointers.TestScan.Error">Test scan error: {0}</sys:String>
+
+    <!-- Pointer Panel: Cache management status messages (code-behind via Res.Get) -->
+    <sys:String x:Key="str.Pointers.Cache.GameCleared">Cache cleared for this game. Next scan will do a full search.</sys:String>
+    <sys:String x:Key="str.Pointers.Cache.GameNotFound">No cache entry found for this game.</sys:String>
+    <sys:String x:Key="str.Pointers.Cache.AllReset">All cache data reset. Backup saved as .001 file.</sys:String>
+    <sys:String x:Key="str.Pointers.Cache.ResetFailed">Failed to reset cache — check logs.</sys:String>
+    <sys:String x:Key="str.Pointers.Cache.Error">Error: {0}</sys:String>
+
+    <!-- Proxy Deploy -->
+    <sys:String x:Key="str.ProxyDeploy.Scan">Scan Steam</sys:String>
+    <sys:String x:Key="str.ProxyDeploy.Refresh">Refresh</sys:String>
+    <sys:String x:Key="str.ProxyDeploy.Deploy">Deploy</sys:String>
+    <sys:String x:Key="str.ProxyDeploy.Undeploy">Undeploy</sys:String>
+    <sys:String x:Key="str.ProxyDeploy.UpdateAll">Update All</sys:String>
+    <sys:String x:Key="str.ProxyDeploy.Force">Force Overwrite</sys:String>
+    <sys:String x:Key="str.ProxyDeploy.SelectAll">All</sys:String>
+    <sys:String x:Key="str.ProxyDeploy.UnselectAll">None</sys:String>
+    <sys:String x:Key="str.ProxyDeploy.InvertSel">Invert</sys:String>
+    <sys:String x:Key="str.ProxyDeploy.SourceDll">Source DLL:</sys:String>
+    <sys:String x:Key="str.ProxyDeploy.ColName">Game</sys:String>
+    <sys:String x:Key="str.ProxyDeploy.ColPath">Binaries Path</sys:String>
+    <sys:String x:Key="str.ProxyDeploy.ColStatus">Status</sys:String>
+    <sys:String x:Key="str.ProxyDeploy.ColVersion">Version</sys:String>
+    <sys:String x:Key="str.ProxyDeploy.ColError">Error</sys:String>
+
+    <!-- Export -->
+    <sys:String x:Key="str.Toolbar.Export">Export</sys:String>
+    <sys:String x:Key="str.Export.SymbolsX64dbg">Symbols (x64dbg .dd64)</sys:String>
+    <sys:String x:Key="str.Export.SymbolsGhidra">Symbols (Ghidra .txt)</sys:String>
+    <sys:String x:Key="str.Export.SymbolsIda">Symbols (IDA .idc)</sys:String>
+    <sys:String x:Key="str.Export.SdkHeader">SDK Header (.h)</sys:String>
+    <sys:String x:Key="str.Export.Usmap">USMAP (.usmap)</sys:String>
+    <sys:String x:Key="str.LiveWalker.ExportHeader">Export .h</sys:String>
+
+    <!-- Property Search -->
+    <sys:String x:Key="str.PropertySearch.QueryHint">Property name (e.g. Health, Mana, Gold)</sys:String>
+    <sys:String x:Key="str.PropertySearch.Search">Search</sys:String>
+    <sys:String x:Key="str.PropertySearch.GameOnly">Game classes only</sys:String>
+    <sys:String x:Key="str.PropertySearch.FindInstances">Find Instances</sys:String>
+    <sys:String x:Key="str.PropertySearch.CopyOffset">Copy Offset</sys:String>
+
+    <!-- Game Class Filter -->
+    <sys:String x:Key="str.GameClassFilter.Load">Load</sys:String>
+    <sys:String x:Key="str.GameClassFilter.GameOnly">Game classes only</sys:String>
+    <sys:String x:Key="str.GameClassFilter.FilterHint">Filter by name...</sys:String>
+    <sys:String x:Key="str.GameClassFilter.FindInstances">Find Instances</sys:String>
+    <sys:String x:Key="str.GameClassFilter.WalkClass">Walk Class</sys:String>
+    <sys:String x:Key="str.GameClassFilter.SuperLabel">Super:</sys:String>
+    <sys:String x:Key="str.GameClassFilter.SuperHint">(All)</sys:String>
+    <sys:String x:Key="str.GameClassFilter.PackageLabel">Package:</sys:String>
+    <sys:String x:Key="str.GameClassFilter.PackageHint">(All)</sys:String>
+    <sys:String x:Key="str.GameClassFilter.Clear">Clear</sys:String>
+
+    <!-- Proxy DLL / Deferred Scan -->
+    <sys:String x:Key="str.Toolbar.StartScan">Start Scan</sys:String>
+    <sys:String x:Key="str.Toolbar.Scanning">Scanning...</sys:String>
+
+    <!-- Errors -->
+    <sys:String x:Key="str.Error.Connection">Failed to connect to pipe server</sys:String>
+    <sys:String x:Key="str.Error.ReadFailed">Memory read failed</sys:String>
+    <sys:String x:Key="str.Error.AlreadyRunning">Another instance of UE5 Dump UI is already running</sys:String>
+
+    <!-- Tooltips: MainWindow toolbar -->
+    <sys:String x:Key="str.Tip.Connect">Connect to injected DLL via named pipe</sys:String>
+    <sys:String x:Key="str.Tip.Disconnect">Disconnect from DLL pipe server</sys:String>
+    <sys:String x:Key="str.Tip.StartScan">Trigger deferred scan (proxy DLL mode)</sys:String>
+    <sys:String x:Key="str.Tip.AddressFormat">Address display format (absolute / module-relative)</sys:String>
+    <sys:String x:Key="str.Tip.CollapsePointers">Collapse pointer chain nodes in CE XML export</sys:String>
+    <sys:String x:Key="str.Tip.ArrayLimit">Max array elements to read inline (2^N)</sys:String>
+    <sys:String x:Key="str.Tip.DropDownLimit">Max CE DropDownList entries (2^N)</sys:String>
+    <sys:String x:Key="str.Tip.PreviewLimit">Struct sub-fields shown in Value column (0 = no preview)</sys:String>
+    <sys:String x:Key="str.Tip.CsxDepth">CSX drilldown depth for child structures</sys:String>
+    <sys:String x:Key="str.Tip.Export">Export object data in various formats</sys:String>
+
+    <!-- Tooltips: Object Tree -->
+    <sys:String x:Key="str.Tip.ObjectTree.Reload">Reload all objects from game process</sys:String>
+    <sys:String x:Key="str.Tip.ObjectTree.Cancel">Cancel current loading operation</sys:String>
+    <sys:String x:Key="str.Tip.ObjectTree.Search">Search objects by name or class</sys:String>
+    <sys:String x:Key="str.Tip.ObjectTree.ClassFilter">Filter by class type</sys:String>
+    <sys:String x:Key="str.Tip.ObjectTree.TextFilter">Filter loaded objects by text</sys:String>
+
+    <!-- Tooltips: Instance Finder -->
+    <sys:String x:Key="str.Tip.InstanceFinder.Search">Search for instances of the specified class</sys:String>
+    <sys:String x:Key="str.Tip.InstanceFinder.ExactMatch">Match class name exactly (no substring)</sys:String>
+    <sys:String x:Key="str.Tip.InstanceFinder.Lookup">Lookup UObject at the specified address</sys:String>
+    <sys:String x:Key="str.Tip.InstanceFinder.CopyAddr">Copy instance address to clipboard</sys:String>
+    <sys:String x:Key="str.Tip.InstanceFinder.OpenWalker">Open this instance in Live Walker</sys:String>
+    <sys:String x:Key="str.Tip.InstanceFinder.ExportCE">Export instance as CE XML pointer chain</sys:String>
+    <sys:String x:Key="str.Tip.InstanceFinder.CopyFieldAddr">Copy field absolute address</sys:String>
+    <sys:String x:Key="str.Tip.InstanceFinder.AA">Generate CE Auto Assembler script</sys:String>
+
+    <!-- Tooltips: Property Search -->
+    <sys:String x:Key="str.Tip.PropertySearch.Search">Search for properties by name across all classes</sys:String>
+    <sys:String x:Key="str.Tip.PropertySearch.GameOnly">Show only game-specific classes (exclude engine)</sys:String>
+    <sys:String x:Key="str.Tip.PropertySearch.FindInstances">Find live instances of this class</sys:String>
+    <sys:String x:Key="str.Tip.PropertySearch.CopyOffset">Copy property offset to clipboard</sys:String>
+
+    <!-- Tooltips: Game Class Filter -->
+    <sys:String x:Key="str.Tip.GameClassFilter.Load">Load class list from game process</sys:String>
+    <sys:String x:Key="str.Tip.GameClassFilter.GameOnly">Show only game-specific classes (exclude engine)</sys:String>
+    <sys:String x:Key="str.Tip.GameClassFilter.SuperFilter">Filter by super/parent class</sys:String>
+    <sys:String x:Key="str.Tip.GameClassFilter.PackageFilter">Filter by UE package name</sys:String>
+    <sys:String x:Key="str.Tip.GameClassFilter.TextFilter">Filter classes by name substring</sys:String>
+    <sys:String x:Key="str.Tip.GameClassFilter.Clear">Clear all filters</sys:String>
+    <sys:String x:Key="str.Tip.GameClassFilter.FindInstances">Find live instances of this class</sys:String>
+    <sys:String x:Key="str.Tip.GameClassFilter.WalkClass">Open class in Live Walker to inspect fields</sys:String>
+
+    <!-- Live Walker: Functions -->
+    <sys:String x:Key="str.LiveWalker.Functions">Functions</sys:String>
+    <sys:String x:Key="str.LiveWalker.FuncGenScript">INV</sys:String>
+    <sys:String x:Key="str.Tip.LiveWalker.FuncGenScript">Generate CE invoke script for this UFunction</sys:String>
+    <sys:String x:Key="str.LiveWalker.FuncPipeInvoke">PIPE</sys:String>
+    <sys:String x:Key="str.Tip.LiveWalker.FuncPipeInvoke">Invoke this function via pipe (DLL executes ProcessEvent in-process, bypasses CE)</sys:String>
+
+    <sys:String x:Key="str.LiveWalker.GuessWhat">Guess?</sys:String>
+
+    <!-- Tooltips: Live Walker -->
+    <sys:String x:Key="str.Tip.LiveWalker.StartWorld">Navigate to GWorld and list top-level objects</sys:String>
+    <sys:String x:Key="str.Tip.LiveWalker.Back">Go back to previous object</sys:String>
+    <sys:String x:Key="str.Tip.LiveWalker.Refresh">Re-read current object fields from memory</sys:String>
+    <sys:String x:Key="str.Tip.LiveWalker.Go">Navigate to the specified address</sys:String>
+    <sys:String x:Key="str.Tip.LiveWalker.ExportCE">Copy full CE XML pointer chain to clipboard</sys:String>
+    <sys:String x:Key="str.Tip.LiveWalker.ExportCEField">Copy CE XML for selected field only</sys:String>
+    <sys:String x:Key="str.Tip.LiveWalker.AobToggle">Use AOB-scanned GWorld symbol instead of hardcoded address (survives game restarts)</sys:String>
+    <sys:String x:Key="str.Tip.LiveWalker.ExportCsx">Export CE Structure Dissect script (.csx)</sys:String>
+    <sys:String x:Key="str.Tip.LiveWalker.ExportHeader">Export C++ SDK header (.h)</sys:String>
+    <sys:String x:Key="str.Tip.LiveWalker.CeAA">Generate CE Auto Assembler script to clipboard</sys:String>
+    <sys:String x:Key="str.Tip.LiveWalker.GuessWhat">Fill gaps between known fields with guessed data types (pointer, float, int, etc.)</sys:String>
+    <sys:String x:Key="str.Tip.LiveWalker.CopyFieldAddr">Copy field absolute address</sys:String>
+    <sys:String x:Key="str.Tip.LiveWalker.CopyFieldName">Copy field name to clipboard</sys:String>
+    <sys:String x:Key="str.Tip.LiveWalker.Search">Search fields by name</sys:String>
+
+    <!-- Tooltips: Pointer Panel -->
+    <sys:String x:Key="str.Tip.Pointers.Copy">Copy address to clipboard</sys:String>
+    <sys:String x:Key="str.Tip.Pointers.CopyScan">Copy AOB scan hit address to clipboard</sys:String>
+    <sys:String x:Key="str.Tip.Pointers.ExtraScan">Run aggressive fallback scan for missing pointers</sys:String>
+    <sys:String x:Key="str.Tip.Pointers.TestExtraScan">Simulate scan progress UI (dev testing only)</sys:String>
+    <sys:String x:Key="str.Tip.Pointers.ClearGameCache">Remove cached scan hints for the current game (next scan will try all patterns)</sys:String>
+    <sys:String x:Key="str.Tip.Pointers.ResetAllCache">Rename the entire cache file with a numbered backup (.001-.010) and start fresh</sys:String>
+
+    <!-- Tooltips: Proxy Deploy -->
+    <sys:String x:Key="str.Tip.ProxyDeploy.Scan">Detect Steam-installed UE games</sys:String>
+    <sys:String x:Key="str.Tip.ProxyDeploy.Refresh">Refresh deploy status for detected games</sys:String>
+    <sys:String x:Key="str.Tip.ProxyDeploy.Deploy">Deploy proxy DLL to selected games</sys:String>
+    <sys:String x:Key="str.Tip.ProxyDeploy.Undeploy">Remove proxy DLL from selected games</sys:String>
+    <sys:String x:Key="str.Tip.ProxyDeploy.UpdateAll">Update all deployed games to latest version</sys:String>
+    <sys:String x:Key="str.Tip.ProxyDeploy.Force">Overwrite even if same version or other proxy detected</sys:String>
+
+</ResourceDictionary>

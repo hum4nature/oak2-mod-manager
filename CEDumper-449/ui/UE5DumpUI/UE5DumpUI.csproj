@@ -1,0 +1,103 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <!-- IL3053: AOT analysis warnings from Avalonia/MicroCom (third-party, safe to suppress).
+         IL2104: DataGrid trim warning — TrimmerRootAssembly preserves it, safe to suppress. -->
+    <NoWarn>$(NoWarn);IL3053;IL2104</NoWarn>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Must be false for Native AOT before Avalonia 12.0 -->
+    <BuiltInComInteropSupport>false</BuiltInComInteropSupport>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+
+    <!-- AOT: off by default, enabled via -p:PublishAot=true on publish -->
+    <PublishAot Condition="'$(PublishAot)' == ''">false</PublishAot>
+    <!-- partial trim: only [Trimmable]-annotated assemblies get aggressive trimming;
+         Avalonia/MicroCom infrastructure is preserved via TrimmerRootAssembly below. -->
+    <TrimMode>partial</TrimMode>
+    <SelfContained>true</SelfContained>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <ApplicationIcon>Assets\Mainicon.ico</ApplicationIcon>
+
+    <!-- ============================================================ -->
+    <!-- Version: major.minor.patch synced with DLL (CMakeLists.txt)  -->
+    <!-- Build number (4th digit) read from shared build_number.txt   -->
+    <!-- ============================================================ -->
+    <VerMajor>1</VerMajor>
+    <VerMinor>0</VerMinor>
+    <VerPatch>0</VerPatch>
+    <BuildNumberFile>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\..\..\build_number.txt'))</BuildNumberFile>
+    <VerBuild Condition="Exists('$(BuildNumberFile)')">$([System.IO.File]::ReadAllText('$(BuildNumberFile)').Trim())</VerBuild>
+    <VerBuild Condition="'$(VerBuild)' == ''">0</VerBuild>
+
+    <Version>$(VerMajor).$(VerMinor).$(VerPatch).$(VerBuild)</Version>
+    <AssemblyVersion>$(VerMajor).$(VerMinor).$(VerPatch).$(VerBuild)</AssemblyVersion>
+    <FileVersion>$(VerMajor).$(VerMinor).$(VerPatch).$(VerBuild)</FileVersion>
+    <InformationalVersion>$(VerMajor).$(VerMinor).$(VerPatch).$(VerBuild)</InformationalVersion>
+    <Product>UE5CEDumper</Product>
+    <Company>UE5CEDumper</Company>
+    <Description>UE5 Object Dumper UI</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="UE5DumpUI.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Avalonia -->
+    <PackageReference Include="Avalonia" Version="11.3.12" />
+    <PackageReference Include="Avalonia.Desktop" Version="11.3.12" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="11.3.12" />
+    <PackageReference Include="Avalonia.Fonts.Inter" Version="11.3.12" />
+    <PackageReference Include="Avalonia.Controls.DataGrid" Version="11.3.12" />
+
+    <!-- MVVM -->
+    <PackageReference Include="CommunityToolkit.Mvvm" Version="8.*" />
+    <PackageReference Include="HarfBuzzSharp" Version="8.3.1.3" />
+    <PackageReference Include="MicroCom.Runtime" Version="0.11.3" />
+
+    <!-- Logging -->
+    <PackageReference Include="Serilog" Version="4.3.1" />
+    <PackageReference Include="Serilog.Sinks.File" Version="7.0.0" />
+    <PackageReference Include="Serilog.Sinks.Console" Version="6.*" />
+    <PackageReference Include="Tmds.DBus.Protocol" Version="0.90.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <AvaloniaResource Include="Resources\**" />
+    <AvaloniaResource Include="Assets\**" />
+  </ItemGroup>
+
+  <!-- Prevent Avalonia assemblies from being over-trimmed during AOT publish.
+       Avalonia.Win32 and Avalonia.Skia are loaded via reflection by UsePlatformDetect()
+       and would be partially trimmed without explicit roots, causing NullReferenceException
+       in the rendering compositor thread at runtime. -->
+  <ItemGroup>
+    <!-- Core -->
+    <TrimmerRootAssembly Include="Avalonia" />
+    <TrimmerRootAssembly Include="Avalonia.Base" />
+    <TrimmerRootAssembly Include="Avalonia.Markup" />
+    <TrimmerRootAssembly Include="Avalonia.Markup.Xaml" />
+    <TrimmerRootAssembly Include="Avalonia.MicroCom" />
+    <!-- Controls & Themes -->
+    <TrimmerRootAssembly Include="Avalonia.Controls" />
+    <TrimmerRootAssembly Include="Avalonia.Controls.DataGrid" />
+    <TrimmerRootAssembly Include="Avalonia.Themes.Fluent" />
+    <!-- Platform backend (loaded via reflection — critical) -->
+    <TrimmerRootAssembly Include="Avalonia.Desktop" />
+    <TrimmerRootAssembly Include="Avalonia.Win32" />
+    <TrimmerRootAssembly Include="Avalonia.Win32.Automation" />
+    <!-- Rendering backend (loaded via reflection — critical) -->
+    <TrimmerRootAssembly Include="Avalonia.Skia" />
+    <!-- Fonts -->
+    <TrimmerRootAssembly Include="Avalonia.Fonts.Inter" />
+    <!-- COM interop -->
+    <TrimmerRootAssembly Include="MicroCom.Runtime" />
+  </ItemGroup>
+</Project>
