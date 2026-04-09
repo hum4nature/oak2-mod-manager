@@ -1,0 +1,3244 @@
+// ============================================================
+// OffsetFinder.cpp — AOB scanning for GObjects/GNames/GWorld
+// ============================================================
+
+#include "OffsetFinder.h"
+#include "HintCache.h"
+#include "Memory.h"
+#define LOG_CAT "SCAN"
+#include "Logger.h"
+#include "Constants.h"
+#include "Signatures.h"
+#include "ObjectArray.h"
+#include "FNamePool.h"
+
+#include <string>
+#include <cstring>
+#include <vector>
+#include <algorithm>  // std::sort
+#include <chrono>     // AOBScanBatch timing
+#include <Winver.h>   // GetFileVersionInfoW / VerQueryValueW
+#include <Psapi.h>    // EnumProcessModules
+
+namespace OffsetFinder {
+
+// ============================================================
+// ComputePEHash — Unique game build identifier
+//
+// Reads PE TimeDateStamp + SizeOfImage from the main module's
+// in-memory NT headers. Format: "%08X%08X" (16 hex chars).
+// This is the same identity key used by Microsoft symbol servers.
+// ============================================================
+static bool ComputePEHash(char* out, size_t bufSize) {
+    if (!out || bufSize < 17) return false;
+    out[0] = '\0';
+
+    uintptr_t base = Mem::GetModuleBase(nullptr);
+    if (!base) return false;
+
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(
+        base + static_cast<LONG>(dos->e_lfanew));
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+
+    snprintf(out, bufSize, "%08X%08X",
+             nt->FileHeader.TimeDateStamp,
+             nt->OptionalHeader.SizeOfImage);
+    return true;
+}
+
+// UE4 TNameEntryArray detection state (set by ValidateGNamesUE4, read by FindAll)
+static bool g_isUE4NameArray = false;
+static int  g_ue4NameStringOffset = 0x10;
+
+// FNameEntry hash prefix size: some UE4 builds (e.g. UE4.26 / FF7Re) prepend a 4-byte
+// ComparisonId/hash before the standard 2-byte header.  Layout:
+//   Standard UE5:       [2B header] [string]        → headerOffset = 0
+//   UE4.26 w/ hash:     [4B hash] [2B header] [string]  → headerOffset = 4
+// Set by ValidateGNames when it detects the hash prefix.
+static int g_fnameEntryHeaderOffset = 0;
+
+// Validation debug log throttle — prevents scan.log rotation from massive
+// false-positive output (e.g. 20K+ matches each producing 14+ debug lines).
+// Reset per-pattern in ScanForTarget; validators check before logging.
+static int  g_validationDbgCount = 0;
+static constexpr int kMaxValidationDbgLogs = 10;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Symbol Export Fallback (RE-UE4SS technique)
+// Many retail UE games export MSVC-mangled symbols. GetProcAddress resolves
+// them in O(1), far faster than AOB scanning.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Try to resolve a symbol from loaded modules' export tables.
+// Since the DLL is injected into the game process, GetModuleHandle(nullptr)
+// returns the game executable's HMODULE.
+static uintptr_t TrySymbolExport(const char* mangledName) {
+    // Try main module first (most common case for monolithic builds)
+    HMODULE hGame = GetModuleHandleW(nullptr);
+    if (hGame) {
+        FARPROC addr = GetProcAddress(hGame, mangledName);
+        if (addr) {
+            LOG_INFO("TrySymbolExport: Found '%s' in main module at 0x%llX",
+                     mangledName, (unsigned long long)(uintptr_t)addr);
+            return reinterpret_cast<uintptr_t>(addr);
+        }
+    }
+
+    // Try other loaded modules (UE modular builds may split into separate DLLs)
+    HMODULE modules[1024];
+    DWORD cbNeeded = 0;
+    if (EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &cbNeeded)) {
+        DWORD count = static_cast<DWORD>((std::min)(static_cast<size_t>(cbNeeded / sizeof(HMODULE)), _countof(modules)));
+        for (DWORD i = 0; i < count; ++i) {
+            if (modules[i] == hGame) continue;
+            FARPROC addr = GetProcAddress(modules[i], mangledName);
+            if (addr) {
+                wchar_t modName[MAX_PATH] = {};
+                GetModuleFileNameW(modules[i], modName, MAX_PATH);
+                LOG_INFO("TrySymbolExport: Found '%s' in module '%ls' at 0x%llX",
+                         mangledName, modName, (unsigned long long)(uintptr_t)addr);
+                return reinterpret_cast<uintptr_t>(addr);
+            }
+        }
+    }
+
+    return 0;
+}
+
+// Validate a candidate GObjects address (basic: check NumElements range)
+// Helper: check if a pointer looks like a valid heap/data pointer (not code/null/low).
+// Used by ValidateGObjects to reject false positives.
+static bool LooksLikeDataPtr(uintptr_t ptr) {
+    if (!ptr || ptr < 0x10000) return false;
+    if (ptr > 0x00007FFFFFFFFFFF) return false;
+    // Reject pointers inside the game module's loaded range (code/rdata/data all contiguous)
+    uintptr_t modBase = Mem::GetModuleBase(nullptr);
+    uintptr_t modSize = Mem::GetModuleSize(nullptr);
+    if (modBase && modSize && ptr >= modBase && ptr < modBase + modSize) return false;
+    return true;
+}
+
+// Cyclic class pointer validation (GAP #10):
+// Reads UObject pointers from chunk[0] and follows obj->Class chain.
+// Valid UObjects have a chain that terminates at UClass (Class == itself).
+// Returns true if >= 2 objects pass with any common FUObjectItem stride.
+static bool ValidateCyclicClassChain(uintptr_t chunk0) {
+    if (!chunk0) return false;
+
+    static const int kStrides[] = { 16, 24, 20 };   // UE5 (16), UE4 (24), alt (20) item sizes
+    static const int kScanRange = 20;                // Scan up to 20 slots (early slots may be null)
+    static const int kMinTried = 2;                  // Need at least 2 non-null objects to judge
+    static const int kMinPass = 2;                   // Minimum passing objects
+    static const int kMaxHops = 16;                  // Max class chain depth
+
+    for (int stride : kStrides) {
+        int passed = 0;
+        int tried  = 0;
+
+        for (int i = 0; i < kScanRange; i++) {
+            uintptr_t objPtr = 0;
+            if (!Mem::ReadSafe(chunk0 + i * stride, objPtr) || !objPtr) continue;
+            if (objPtr < 0x10000 || objPtr > 0x00007FFFFFFFFFFF) continue;
+            tried++;
+
+            // Follow Class chain: obj->Class->Class->... looking for self-referential UClass
+            uintptr_t current = objPtr;
+            bool valid = false;
+            for (int hop = 0; hop < kMaxHops; hop++) {
+                uintptr_t cls = 0;
+                if (!Mem::ReadSafe(current + Constants::OFF_UOBJECT_CLASS, cls)) break;
+                if (cls < 0x10000 || cls > 0x00007FFFFFFFFFFF) break;
+
+                // UClass terminates: its ClassPrivate points to itself
+                uintptr_t clsCls = 0;
+                if (!Mem::ReadSafe(cls + Constants::OFF_UOBJECT_CLASS, clsCls)) break;
+                if (clsCls == cls) { valid = true; break; }
+
+                current = cls;
+            }
+            if (valid) passed++;
+
+            // Early exit: already have enough passing objects
+            if (passed >= kMinPass) break;
+        }
+
+        if (tried >= kMinTried && passed >= kMinPass) return true;
+    }
+    return false;
+}
+
+static bool ValidateGObjects(uintptr_t addr) {
+    if (!addr) return false;
+
+    // --- Tier 1: Try all known presets with full validation ---
+    // Includes chunk consistency checks and decryption support.
+    // maxCOff/numCOff = -1 means "flat" layout (no chunk indirection).
+    // Flat arrays: Objects* points directly to FUObjectItem[], not FUObjectItem*[].
+    struct { int objOff; int maxOff; int numOff; int maxCOff; int numCOff; const char* name; } presets[] = {
+        { 0x00, 0x10, 0x14, 0x18, 0x1C, "Default" },
+        { 0x10, 0x00, 0x04, 0x08, 0x0C, "Back4Blood" },
+        { 0x18, 0x10, 0x00, 0x14, 0x20, "Multiversus" },
+        { 0x18, 0x00, 0x14, 0x10, 0x04, "MindsEye" },
+        { 0x10, 0x18, 0x1C, 0x20, 0x24, "UE4-Extended" },
+        { 0x10, 0x20, 0x24, 0x28, 0x2C, "UE5-Extended" },  // GC prefix + PreAllocatedObjects ptr
+        { 0x00, 0x08, 0x0C,   -1,   -1, "Flat" },           // FFixedUObjectArray: no chunks (OT / early UE4)
+    };
+
+    for (auto& P : presets) {
+        int32_t num = 0, max = 0;
+        if (!Mem::ReadSafe(addr + P.numOff, num)) continue;
+        if (!Mem::ReadSafe(addr + P.maxOff, max)) continue;
+        if (num < 0x1000 || num > 0x400000) continue;
+        if (max < num || max > 0x800000) continue;
+
+        // Chunk consistency (if chunk offset fields are valid)
+        if (P.maxCOff >= 0 && P.numCOff >= 0) {
+            int32_t numC = 0, maxC = 0;
+            if (!Mem::ReadSafe(addr + P.numCOff, numC)) continue;
+            if (!Mem::ReadSafe(addr + P.maxCOff, maxC)) continue;
+            if (numC < 1 || maxC < 1 || numC > maxC) continue;
+        }
+
+        uintptr_t objPtr = 0;
+        if (!Mem::ReadSafe(addr + P.objOff, objPtr)) continue;
+        objPtr = ObjectArray::DecryptObjectPtr(objPtr);
+
+        bool isFlat = (P.maxCOff < 0 && P.numCOff < 0);
+
+        if (isFlat) {
+            // Flat array: objPtr points directly to FUObjectItem[] data (no chunk indirection).
+            // Dereferencing objPtr would give a UObject* (first item), not a chunk pointer.
+            if (!LooksLikeDataPtr(objPtr)) continue;
+            if (!ValidateCyclicClassChain(objPtr)) continue;
+        } else {
+            // Chunked array: objPtr is FUObjectItem** (array of chunk pointers)
+            uintptr_t chunk0 = 0;
+            if (!Mem::ReadSafe(objPtr, chunk0)) continue;
+
+            if (chunk0 == 0) {
+                if (!LooksLikeDataPtr(objPtr)) continue;
+            } else {
+                if (!LooksLikeDataPtr(chunk0)) continue;
+            }
+
+            // Cyclic class chain validation (GAP #10): verify actual UObject instances
+            uintptr_t validateBase = chunk0 ? chunk0 : objPtr;
+            if (!ValidateCyclicClassChain(validateBase)) continue;
+        }
+
+        Logger::Info("SCAN:GObj", "ValidateGObjects: Valid at 0x%llX (preset %s, Num=%d, Max=%d, Objects=0x%llX%s)",
+                 static_cast<unsigned long long>(addr), P.name, num, max,
+                 static_cast<unsigned long long>(objPtr), isFlat ? " [flat]" : "");
+        return true;
+    }
+
+    // --- Tier 2: Relaxed fallback (prevents regression) ---
+    // Only check NumElements range + Objects pointer validity.
+    // isFlat: objPtr is FUObjectItem[] directly (no chunk indirection).
+    struct { int numOff; int objOff; bool isFlat; const char* name; } relaxed[] = {
+        { 0x14, 0x00, false, "A/C" },
+        { 0x04, 0x10, false, "B"   },
+        { 0x1C, 0x10, false, "D"   },
+        { 0x24, 0x10, false, "E"   },    // UE5-Extended: GC prefix + PreAllocatedObjects
+        { 0x0C, 0x00, true,  "Flat" },   // FFixedUObjectArray: no chunks (OT / early UE4)
+    };
+
+    for (auto& L : relaxed) {
+        int32_t numElements = 0;
+        if (!Mem::ReadSafe(addr + L.numOff, numElements)) continue;
+        if (numElements < 0x1000 || numElements > 0x400000) continue;
+
+        uintptr_t objPtr = 0;
+        if (!Mem::ReadSafe(addr + L.objOff, objPtr)) continue;
+        objPtr = ObjectArray::DecryptObjectPtr(objPtr);
+
+        if (L.isFlat) {
+            // Flat array: objPtr is FUObjectItem[] directly
+            if (!LooksLikeDataPtr(objPtr)) continue;
+            if (!ValidateCyclicClassChain(objPtr)) continue;
+        } else {
+            uintptr_t chunk0 = 0;
+            if (!Mem::ReadSafe(objPtr, chunk0)) continue;
+
+            if (chunk0 == 0) {
+                if (!LooksLikeDataPtr(objPtr)) continue;
+            } else {
+                if (!LooksLikeDataPtr(chunk0)) continue;
+            }
+
+            // Cyclic class chain validation (GAP #10): verify actual UObject instances
+            uintptr_t validateBase = chunk0 ? chunk0 : objPtr;
+            if (!ValidateCyclicClassChain(validateBase)) continue;
+        }
+
+        Logger::Info("SCAN:GObj", "ValidateGObjects: Valid at 0x%llX (relaxed %s, Num=%d, Objects=0x%llX%s)",
+                 static_cast<unsigned long long>(addr), L.name, numElements,
+                 static_cast<unsigned long long>(objPtr), L.isFlat ? " [flat]" : "");
+        return true;
+    }
+
+    // Log failure with diagnostic info (throttled — data scan can produce 20K+ failures)
+    if (g_validationDbgCount < kMaxValidationDbgLogs) {
+        int32_t numA = 0, numB = 0, numD = 0;
+        Mem::ReadSafe(addr + 0x14, numA);
+        Mem::ReadSafe(addr + 0x04, numB);
+        Mem::ReadSafe(addr + 0x1C, numD);
+        Logger::Warn("SCAN:GObj", "ValidateGObjects: Failed at 0x%llX (Num@+14=%d, Num@+04=%d, Num@+1C=%d)",
+                 static_cast<unsigned long long>(addr), numA, numB, numD);
+    }
+    return false;
+}
+
+// Forward declarations for validators used across sections
+static bool CorroborateFNameChunk(uintptr_t chunkAddr);
+static bool ValidateGNamesUE4(uintptr_t addr, int& outStringOffset);
+static bool ValidateGNamesAny(uintptr_t addr);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Structural validation for GNames (FNamePool):
+//   1. FRWLock at +0x00 should be 0 (unlocked)
+//   2. CurrentBlock at +0x08 should be a small int
+//   3. Blocks[CurrentBlock+1] should be NULL (no block after last used)
+//   4. Blocks[0] starts with "None" FNameEntry (exact header format match)
+//   5. Blocks[0] corroborated with UE type name markers
+// ─────────────────────────────────────────────────────────────────────────────
+static bool ValidateGNamesStructural(uintptr_t addr) {
+    if (!addr) return false;
+
+    // FRWLock at +0x00 should be 0 when not locked
+    uint64_t rwLock = 0;
+    if (!Mem::ReadSafe(addr, rwLock)) return false;
+    if (rwLock != 0) {
+        if (g_validationDbgCount++ < kMaxValidationDbgLogs)
+            Logger::Debug("SCAN:GNam", "ValidateGNamesStructural: FRWLock=0x%llX (non-zero) at 0x%llX",
+                      (unsigned long long)rwLock, (unsigned long long)addr);
+        return false;
+    }
+
+    // CurrentBlock at +0x08
+    int32_t currentBlock = 0;
+    if (!Mem::ReadSafe(addr + 0x08, currentBlock)) return false;
+    if (currentBlock < 0 || currentBlock > 8192) {
+        if (g_validationDbgCount++ < kMaxValidationDbgLogs)
+            Logger::Debug("SCAN:GNam", "ValidateGNamesStructural: CurrentBlock=%d out of range at 0x%llX",
+                      currentBlock, (unsigned long long)addr);
+        return false;
+    }
+
+    // Blocks[CurrentBlock+1] should be NULL (end sentinel)
+    uintptr_t nextBlock = 0;
+    if (!Mem::ReadSafe(addr + 0x10 + ((currentBlock + 1) * 8), nextBlock)) return false;
+    if (nextBlock != 0) {
+        if (g_validationDbgCount++ < kMaxValidationDbgLogs)
+            Logger::Debug("SCAN:GNam", "ValidateGNamesStructural: Blocks[%d+1] = 0x%llX (non-null) at 0x%llX",
+                      currentBlock, (unsigned long long)nextBlock, (unsigned long long)addr);
+        return false;
+    }
+
+    // Blocks[0] should point to "None" FNameEntry
+    uintptr_t block0 = 0;
+    if (!Mem::ReadSafe(addr + 0x10, block0) || block0 == 0) return false;
+
+    // Validate block0 as a "None" FNameEntry using exact header format matching.
+    // Try both standard (header at +0, string at +2) and hash-prefixed (header at +4, string at +6).
+    // For each, try Format A (header >> 6 = 4) and Format B ((header >> 1) & 0x7FF = 4).
+    auto checkNoneAtOffset = [&](int hdrOff) -> bool {
+        uint16_t header = 0;
+        if (!Mem::ReadSafe(block0 + hdrOff, header)) return false;
+
+        auto tryFormat = [&](int shift, int mask) -> bool {
+            int len = (header >> shift) & mask;
+            if (len != 4) return false;
+            char name[5] = {};
+            if (!Mem::ReadBytesSafe(block0 + hdrOff + 2, name, 4)) return false;
+            return strcmp(name, "None") == 0;
+        };
+
+        return tryFormat(6, 0x3FF) || tryFormat(1, 0x7FF);
+    };
+
+    bool noneFound = checkNoneAtOffset(0);
+    if (!noneFound) noneFound = checkNoneAtOffset(4);  // Hash-prefixed UE4.26 layout
+
+    if (noneFound && g_fnameEntryHeaderOffset == 0) {
+        // If standard check failed but hash-prefixed succeeded, record it
+        if (!checkNoneAtOffset(0)) g_fnameEntryHeaderOffset = 4;
+    }
+
+    if (!noneFound) {
+        if (g_validationDbgCount++ < kMaxValidationDbgLogs) {
+            uint16_t h0 = 0, h4 = 0;
+            Mem::ReadSafe(block0, h0);
+            Mem::ReadSafe(block0 + 4, h4);
+            Logger::Debug("SCAN:GNam", "ValidateGNamesStructural: Blocks[0] headers=0x%04X/0x%04X don't decode to 'None' at 0x%llX",
+                      h0, h4, (unsigned long long)addr);
+        }
+        return false;
+    }
+
+    // Corroborate: the first chunk must also contain common UE type names
+    // (ByteProperty, Object, Class, etc.) — random heap data won't have these.
+    if (!CorroborateFNameChunk(block0)) {
+        if (g_validationDbgCount++ < kMaxValidationDbgLogs)
+            Logger::Debug("SCAN:GNam", "ValidateGNamesStructural: Blocks[0] corroboration failed at 0x%llX",
+                      (unsigned long long)addr);
+        return false;
+    }
+
+    Logger::Info("SCAN:GNam", "ValidateGNamesStructural: Valid FNamePool at 0x%llX (CurrentBlock=%d, corroborated)",
+             (unsigned long long)addr, currentBlock);
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FindGObjectsByDataScan — fallback: collect ALL RIP-relative pointer
+// references from .text that resolve into the data section, then validate
+// each candidate as a GObjects/FUObjectArray.
+// ─────────────────────────────────────────────────────────────────────────────
+static uintptr_t FindGObjectsByDataScan() {
+    Logger::Info("SCAN:GObj", "FindGObjectsByDataScan: Collecting static pointer references...");
+
+    uintptr_t base = Mem::GetModuleBase(nullptr);
+    if (!base) return 0;
+    size_t modSize = Mem::GetModuleSize(nullptr);
+    if (!modSize) return 0;
+
+    auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + static_cast<DWORD>(dos->e_lfanew));
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+
+    // Find code and data section ranges
+    const IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
+    uintptr_t codeStart = 0, codeEnd = 0;
+    uintptr_t dataStart = 0, dataEnd = 0;
+
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+        if (!section->Misc.VirtualSize || !section->VirtualAddress) continue;
+        uintptr_t secBase = base + section->VirtualAddress;
+        uintptr_t secEnd  = secBase + section->Misc.VirtualSize;
+
+        if (section->Characteristics & IMAGE_SCN_MEM_EXECUTE) {
+            if (!codeStart || secBase < codeStart) codeStart = secBase;
+            if (secEnd > codeEnd) codeEnd = secEnd;
+        } else if (section->Characteristics & IMAGE_SCN_MEM_WRITE) {
+            // First writable, non-exec section is the data section
+            if (!dataStart) { dataStart = secBase; dataEnd = secEnd; }
+        }
+    }
+
+    if (!codeStart || !dataStart) {
+        Logger::Warn("SCAN:GObj", "FindGObjectsByDataScan: Could not identify code/data sections");
+        return 0;
+    }
+
+    Logger::Debug("SCAN:GObj", "FindGObjectsByDataScan: code=[0x%llX-0x%llX], data=[0x%llX-0x%llX]",
+              (unsigned long long)codeStart, (unsigned long long)codeEnd,
+              (unsigned long long)dataStart, (unsigned long long)dataEnd);
+
+    // Scan the code section for MOV reg,[rip+disp32] instructions (48 8B 0D / 48 8B 05 / 4C 8B 0D / etc.)
+    // that resolve to addresses within the data section.
+    // Opcodes: 48 8B {05,0D,15,1D,25,2D,35,3D} and 4C 8B {05,0D,15,1D,25,2D,35,3D}
+    struct StaticPtr {
+        uintptr_t instrAddr;    // address of the instruction
+        uintptr_t targetAddr;   // resolved data-section address
+    };
+    std::vector<StaticPtr> bag;
+
+    for (uintptr_t scan = codeStart; scan + 7 < codeEnd; ++scan) {
+        uint8_t b0 = 0, b1 = 0, b2 = 0;
+        if (!Mem::ReadSafe(scan, b0)) continue;
+        if (b0 != 0x48 && b0 != 0x4C) continue;
+        if (!Mem::ReadSafe(scan + 1, b1)) continue;
+        if (b1 != 0x8B && b1 != 0x8D) continue;  // MOV or LEA
+        if (!Mem::ReadSafe(scan + 2, b2)) continue;
+        // ModR/M byte: mod=00, r/m=101 (RIP-relative) => lower 3 bits = 5
+        if ((b2 & 0x07) != 0x05) continue;
+
+        // Inline RIP resolution (avoids Mem::ResolveRIP's per-call DEBUG logging
+        // which produces ~98K lines and causes log rotation overflow)
+        int32_t rel32 = 0;
+        if (!Mem::ReadSafe<int32_t>(scan + 3, rel32)) continue;
+        uintptr_t target = scan + 7 + rel32;
+        if (!target) continue;
+
+        // For MOV instructions (8B), the target is a pointer — dereference it
+        uintptr_t value = target;
+        if (b1 == 0x8B) {
+            if (!Mem::ReadSafe(target, value) || !value) continue;
+        }
+
+        // Check if resolved address is in the data section range
+        if (target >= dataStart && target < dataEnd) {
+            bag.push_back({ scan, target });
+        }
+    }
+
+    Logger::Info("SCAN:GObj", "FindGObjectsByDataScan: Found %zu static pointers in data section", bag.size());
+
+    // Try each candidate with GObjects validation
+    // Throttle validation failure logging: data scan can produce 20K+ candidates,
+    // each logging a WARN line on failure — causing log rotation overflow.
+    int dataScanFailCount = 0;
+    constexpr int kMaxDataScanFailLogs = 20;
+    g_validationDbgCount = 0;  // Reset throttle for validators
+    for (auto& sp : bag) {
+        uintptr_t candidate = 0;
+        if (!Mem::ReadSafe(sp.targetAddr, candidate) || !candidate) continue;
+        if (ValidateGObjects(candidate)) {
+            Logger::Info("SCAN:GObj", "FindGObjectsByDataScan: GObjects validated at 0x%llX (via instr@0x%llX)",
+                     (unsigned long long)candidate, (unsigned long long)sp.instrAddr);
+            if (dataScanFailCount > kMaxDataScanFailLogs) {
+                Logger::Info("SCAN:GObj", "FindGObjectsByDataScan: (%d validation failures were suppressed)",
+                         dataScanFailCount - kMaxDataScanFailLogs);
+            }
+            return candidate;
+        }
+        dataScanFailCount++;
+        if (dataScanFailCount == kMaxDataScanFailLogs) {
+            Logger::Info("SCAN:GObj", "FindGObjectsByDataScan: Throttling validation failure logs (showed first %d)",
+                     kMaxDataScanFailLogs);
+            g_validationDbgCount = kMaxValidationDbgLogs;  // Suppress further validator debug output
+        }
+    }
+
+    Logger::Warn("SCAN:GObj", "FindGObjectsByDataScan: No valid GObjects found among %zu candidates", bag.size());
+    return 0;
+}
+
+// ============================================================
+// ScanForTarget — Unified AOB scanning engine
+//
+// Iterates all AobSignature entries for a target in priority order.
+// For each pattern: AOBScanAll to find ALL matches, resolve RIP,
+// apply adjustment, validate, and select the best result.
+// Returns the winning address or 0 on failure.
+// ============================================================
+
+using ValidatorFn = bool(*)(uintptr_t);
+
+struct PatternScanResult {
+    const char* id       = nullptr;
+    int         hitCount = 0;
+    uintptr_t   selected = 0;
+    bool        validated = false;
+};
+
+struct ScanReport {
+    const char*                    targetName = "";
+    std::vector<PatternScanResult> results;
+    uintptr_t                      finalAddress = 0;
+    uintptr_t                      scanAddr     = 0;  // AOB match address (instruction that references the pointer)
+    const char*                    winningId    = nullptr;
+    const AobSignature*            winningSig   = nullptr;  // Winning pattern (for AOB metadata)
+    bool                           hintUsed     = false;    // true if winner came from hint cache
+};
+
+// Try to resolve a symbol export from any loaded module.
+// Reuses the existing TrySymbolExport helper.
+static uintptr_t ResolveSymbolExport(const AobSignature& sig, ValidatorFn validate) {
+    uintptr_t addr = TrySymbolExport(sig.pattern);
+    if (!addr) return 0;
+
+    // Direct validation
+    if (validate(addr)) return addr;
+
+    // Deref and validate
+    uintptr_t derefed = 0;
+    if (Mem::ReadSafe(addr, derefed) && derefed && validate(derefed))
+        return derefed;
+
+    return 0;
+}
+
+// Scan the first N bytes of a function body for RIP-relative LEA/MOV
+// instructions and validate each resolved target.
+// Shared by CallFollow and SymbolCallFollow.
+static uintptr_t ScanFunctionBodyForRipRef(
+    uintptr_t funcAddr, const char* sigId, ValidatorFn validate, int scanBytes = 256)
+{
+    for (int off = 0; off + 7 <= scanBytes; ++off) {
+        uint8_t b0 = 0, b1 = 0, b2 = 0;
+        if (!Mem::ReadSafe(funcAddr + off, b0)) break;
+        if (b0 != 0x48 && b0 != 0x4C) continue;
+        if (!Mem::ReadSafe(funcAddr + off + 1, b1)) break;
+        if (b1 != 0x8B && b1 != 0x8D) continue;
+        if (!Mem::ReadSafe(funcAddr + off + 2, b2)) break;
+        if ((b2 & 0x07) != 0x05) continue; // RIP-relative addressing
+
+        uintptr_t target = Mem::ResolveRIP(funcAddr + off, 3, 7);
+        if (!target) continue;
+
+        uintptr_t candidate = target;
+        if (b1 == 0x8B) { // MOV — need deref
+            if (!Mem::ReadSafe(target, candidate) || !candidate) continue;
+        }
+
+        if (validate(candidate)) {
+            LOG_INFO("FuncBodyScan [%s]: Found at 0x%llX (func+0x%X, %s)",
+                     sigId, (unsigned long long)candidate, off,
+                     b1 == 0x8D ? "LEA" : "MOV");
+            return candidate;
+        }
+    }
+    return 0;
+}
+
+// Follow a CALL instruction at callOffset within the matched pattern,
+// then scan the called function's body for RIP-relative references.
+// Used for GNames V7_FNAME_CTOR pattern.
+static uintptr_t ResolveCallFollow(uintptr_t matchAddr, const AobSignature& sig, ValidatorFn validate) {
+    uintptr_t callInstr = matchAddr + sig.callOffset;
+    uint8_t opcode = 0;
+    Mem::ReadSafe(callInstr, opcode);
+    if (opcode != 0xE8) return 0;
+
+    int32_t rel32 = 0;
+    if (!Mem::ReadSafe(callInstr + 1, rel32)) return 0;
+    uintptr_t funcAddr = callInstr + 5 + rel32;
+
+    LOG_DEBUG("CallFollow [%s]: Following CALL to function at 0x%llX",
+              sig.id, (unsigned long long)funcAddr);
+
+    return ScanFunctionBodyForRipRef(funcAddr, sig.id, validate);
+}
+
+// Resolve a MSVC symbol export as a function address, then scan
+// the function body for RIP-relative references to the target global.
+// Used for GNames: FName::ToString/FName::FName export → FNamePool ref.
+static uintptr_t ResolveSymbolCallFollow(const AobSignature& sig, ValidatorFn validate) {
+    uintptr_t funcAddr = TrySymbolExport(sig.pattern);
+    if (!funcAddr) return 0;
+
+    LOG_DEBUG("SymbolCallFollow [%s]: Scanning function body at 0x%llX",
+              sig.id, (unsigned long long)funcAddr);
+
+    return ScanFunctionBodyForRipRef(funcAddr, sig.id, validate);
+}
+
+// Try resolving a single match address according to the signature's resolve strategy.
+// Returns validated address or 0.
+static uintptr_t TryResolveMatch(uintptr_t matchAddr, const AobSignature& sig, ValidatorFn validate) {
+    uintptr_t instrAddr = matchAddr + sig.instrOffset;
+    uintptr_t target = Mem::ResolveRIP(instrAddr, sig.opcodeLen, sig.totalLen);
+    if (!target) return 0;
+
+    // Try with adjustment first (e.g. -0x10), then without
+    auto tryValidate = [&](uintptr_t addr) -> uintptr_t {
+        if (!addr) return 0;
+        // For GWorld write-patterns: check if pointer value is accessible
+        if (sig.target == AobTarget::GWorld) {
+            uintptr_t world = 0;
+            if (!Mem::ReadSafe(addr, world)) return 0;
+            if (!sig.gworldAllowNull && world == 0) return 0;
+            // Basic pointer sanity for non-null values
+            if (world != 0 && (world < 0x10000 || world > 0x00007FFFFFFFFFFF))
+                return 0;
+        }
+        if (validate(addr)) return addr;
+        return 0;
+    };
+
+    // RipDirect or first pass of RipBoth
+    if (sig.resolve == AobResolve::RipDirect || sig.resolve == AobResolve::RipBoth) {
+        if (sig.adjustment != 0) {
+            uintptr_t adjusted = tryValidate(target + sig.adjustment);
+            if (adjusted) return adjusted;
+        }
+        uintptr_t direct = tryValidate(target);
+        if (direct) return direct;
+    }
+
+    // RipDeref or second pass of RipBoth
+    if (sig.resolve == AobResolve::RipDeref || sig.resolve == AobResolve::RipBoth) {
+        uintptr_t value = 0;
+        if (Mem::ReadSafe(target, value) && value) {
+            if (sig.adjustment != 0) {
+                uintptr_t adjusted = tryValidate(value + sig.adjustment);
+                if (adjusted) return adjusted;
+            }
+            uintptr_t derefed = tryValidate(value);
+            if (derefed) return derefed;
+        }
+    }
+
+    return 0;
+}
+
+// Batch size for multi-anchor AOBScanBatch. 8 patterns per batch means
+// at most 8 AVX2 cmpeq operations per 32-byte window — negligible overhead
+// compared to the massive memory bandwidth savings from scanning .text once
+// per batch instead of once per pattern.
+static constexpr int kBatchSize = 8;
+
+static uintptr_t ScanForTarget(
+    const AobSignature* patterns, size_t count,
+    ValidatorFn validate, ScanReport& report,
+    bool tryMultiModule,
+    const char* hintPatternId = nullptr)
+{
+    // Sort entries by priority (patterns array is constexpr, so copy pointers)
+    std::vector<const AobSignature*> sorted;
+    sorted.reserve(count);
+    for (size_t i = 0; i < count; ++i) sorted.push_back(&patterns[i]);
+    std::sort(sorted.begin(), sorted.end(),
+              [](const AobSignature* a, const AobSignature* b) { return a->priority < b->priority; });
+
+    // ── Hint phase: try cached winning pattern first ─────────────────
+    // If a previous scan recorded a winning AOB pattern for this PE hash,
+    // try it first as a single-pattern scan before the normal phases.
+    // On hit: immediate return (massive speedup for repeat scans).
+    // On miss: remove from list (avoid re-scanning) and fall through.
+    if (hintPatternId && hintPatternId[0]) {
+        auto it = std::find_if(sorted.begin(), sorted.end(),
+            [&](const AobSignature* s) { return strcmp(s->id, hintPatternId) == 0; });
+
+        if (it != sorted.end()) {
+            const AobSignature* hintSig = *it;
+
+            // Only use hint for AOB-type patterns (not exports/callfollow)
+            if (hintSig->resolve != AobResolve::SymbolExport &&
+                hintSig->resolve != AobResolve::SymbolCallFollow &&
+                hintSig->resolve != AobResolve::CallFollow) {
+
+                LOG_INFO("[%s] Hint: trying cached pattern '%s' first...",
+                         report.targetName, hintPatternId);
+
+                g_validationDbgCount = 0;
+
+                auto hintT0 = std::chrono::high_resolution_clock::now();
+                uintptr_t matchAddr = Mem::AOBScan(hintSig->pattern);
+                auto hintT1 = std::chrono::high_resolution_clock::now();
+                auto hintUs = std::chrono::duration_cast<std::chrono::microseconds>(hintT1 - hintT0).count();
+
+                PatternScanResult pr;
+                pr.id = hintSig->id;
+                pr.hitCount = matchAddr ? 1 : 0;
+
+                if (matchAddr) {
+                    uintptr_t resolved = TryResolveMatch(matchAddr, *hintSig, validate);
+                    pr.selected = resolved;
+                    pr.validated = (resolved != 0);
+                    report.results.push_back(pr);
+
+                    if (resolved) {
+                        LOG_INFO("[%s] Hint HIT: '%s' -> 0x%llX (scan %lld us, skipping remaining patterns)",
+                                 report.targetName, hintPatternId,
+                                 static_cast<unsigned long long>(resolved),
+                                 static_cast<long long>(hintUs));
+                        report.finalAddress = resolved;
+                        report.scanAddr = matchAddr;
+                        report.winningId = hintSig->id;
+                        report.winningSig = hintSig;
+                        report.hintUsed = true;
+                        return resolved;
+                    }
+                } else {
+                    report.results.push_back(pr);
+                }
+
+                LOG_INFO("[%s] Hint MISS: '%s' (scan %lld us) — falling back to full scan",
+                         report.targetName, hintPatternId, static_cast<long long>(hintUs));
+
+                // Remove hint from sorted list to avoid re-scanning in Phase 2
+                sorted.erase(it);
+            } else {
+                LOG_INFO("[%s] Hint: pattern '%s' is non-AOB type (%d), skipping hint",
+                         report.targetName, hintPatternId, static_cast<int>(hintSig->resolve));
+            }
+        } else {
+            LOG_INFO("[%s] Hint: cached pattern '%s' not found in current pattern set",
+                     report.targetName, hintPatternId);
+        }
+    }
+
+    // ── Phase 1: Handle non-AOB patterns sequentially (unchanged) ────
+    // Symbol exports, CallFollow, etc. are rare (priority 0-5) and don't
+    // benefit from batching. Process them first with immediate early exit.
+    std::vector<const AobSignature*> aobPatterns;
+    aobPatterns.reserve(sorted.size());
+
+    for (const AobSignature* sig : sorted) {
+        g_validationDbgCount = 0;
+
+        PatternScanResult pr;
+        pr.id = sig->id;
+
+        // ── Symbol Export (variable) ─────────────────────────
+        if (sig->resolve == AobResolve::SymbolExport) {
+            uintptr_t result = ResolveSymbolExport(*sig, validate);
+            pr.hitCount = result ? 1 : 0;
+            pr.selected = result;
+            pr.validated = (result != 0);
+            report.results.push_back(pr);
+            if (result) {
+                LOG_INFO("[%s] %s: Symbol export -> 0x%llX",
+                         report.targetName, sig->id, (unsigned long long)result);
+                report.finalAddress = result;
+                report.winningId = sig->id;
+                report.winningSig = sig;
+                return result;
+            }
+            continue;
+        }
+
+        // ── Symbol Call Follow (function → scan body) ────────
+        if (sig->resolve == AobResolve::SymbolCallFollow) {
+            uintptr_t result = ResolveSymbolCallFollow(*sig, validate);
+            pr.hitCount = result ? 1 : 0;
+            pr.selected = result;
+            pr.validated = (result != 0);
+            report.results.push_back(pr);
+            if (result) {
+                LOG_INFO("[%s] %s: SymbolCallFollow -> 0x%llX",
+                         report.targetName, sig->id, (unsigned long long)result);
+                report.finalAddress = result;
+                report.winningId = sig->id;
+                report.winningSig = sig;
+                return result;
+            }
+            continue;
+        }
+
+        // ── CallFollow ───────────────────────────────────────
+        if (sig->resolve == AobResolve::CallFollow) {
+            uintptr_t matchAddr = Mem::AOBScan(sig->pattern);
+            pr.hitCount = matchAddr ? 1 : 0;
+            if (matchAddr) {
+                uintptr_t result = ResolveCallFollow(matchAddr, *sig, validate);
+                pr.selected = result;
+                pr.validated = (result != 0);
+            }
+            report.results.push_back(pr);
+            if (pr.validated) {
+                LOG_INFO("[%s] %s: CallFollow -> 0x%llX",
+                         report.targetName, sig->id, (unsigned long long)pr.selected);
+                report.finalAddress = pr.selected;
+                report.scanAddr = matchAddr;
+                report.winningId = sig->id;
+                report.winningSig = sig;
+                return pr.selected;
+            }
+            continue;
+        }
+
+        // Collect AOB patterns for batched scanning
+        aobPatterns.push_back(sig);
+    }
+
+    // ── Phase 2: Batched AOB scanning ────────────────────────────────
+    // Process AOB patterns in batches of kBatchSize. Each batch scans
+    // .text ONCE for all patterns in the batch (multi-anchor AVX2).
+    const int totalAob = static_cast<int>(aobPatterns.size());
+    const int totalBatches = (totalAob + kBatchSize - 1) / kBatchSize;
+
+    auto batchT0 = std::chrono::high_resolution_clock::now();
+
+    for (int batchIdx = 0; batchIdx < totalBatches; ++batchIdx) {
+        const int batchStart = batchIdx * kBatchSize;
+        const int batchEnd   = (std::min)(batchStart + kBatchSize, totalAob);
+        const int batchCount = batchEnd - batchStart;
+
+        // Build pattern string array + index mapping for AOBScanBatch
+        std::vector<const char*> patStrings(batchCount);
+        std::vector<int>         patIndices(batchCount);
+        for (int j = 0; j < batchCount; ++j) {
+            patStrings[j] = aobPatterns[batchStart + j]->pattern;
+            patIndices[j] = j;
+        }
+
+        auto t0 = std::chrono::high_resolution_clock::now();
+        auto batchResults = Mem::AOBScanBatch(
+            patStrings.data(), patIndices.data(), batchCount);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        auto batchUs = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+
+        LOG_INFO("[%s] Batch %d/%d (%d patterns): scanned in %lld us",
+                 report.targetName, batchIdx + 1, totalBatches, batchCount,
+                 static_cast<long long>(batchUs));
+
+        // ── Two-pass validation within each batch ──────────────────────
+        // Pass 1: Validate patterns that got batch hits (no extra I/O).
+        //         If a winner is found here, multi-module fallback for
+        //         zero-hit patterns is skipped entirely.
+        // Pass 2: Multi-module fallback for zero-hit patterns (expensive,
+        //         only runs when pass 1 finds no winner).
+
+        // Pass 1: batch-hit patterns in priority order
+        for (int j = 0; j < batchCount; ++j) {
+            if (batchResults[j].matches.empty()) continue;
+
+            const AobSignature* sig = aobPatterns[batchStart + j];
+            g_validationDbgCount = 0;
+
+            PatternScanResult pr;
+            pr.id = sig->id;
+            pr.hitCount = static_cast<int>(batchResults[j].matches.size());
+
+            // Try to validate each match
+            uintptr_t bestResult = 0;
+            uintptr_t bestMatchAddr = 0;
+            for (uintptr_t matchAddr : batchResults[j].matches) {
+                uintptr_t resolved = TryResolveMatch(matchAddr, *sig, validate);
+                if (resolved) {
+                    bestResult = resolved;
+                    bestMatchAddr = matchAddr;
+                    break; // Take first validated match
+                }
+            }
+
+            if (g_validationDbgCount > kMaxValidationDbgLogs) {
+                LOG_INFO("[%s] %s: Validation debug output throttled (%d entries, showed first %d)",
+                         report.targetName, sig->id, g_validationDbgCount, kMaxValidationDbgLogs);
+            }
+
+            pr.selected = bestResult;
+            pr.validated = (bestResult != 0);
+            report.results.push_back(pr);
+
+            if (bestResult) {
+                if (pr.hitCount > 1) {
+                    LOG_INFO("[%s] %s: %d matches, validated -> 0x%llX",
+                             report.targetName, sig->id, pr.hitCount,
+                             (unsigned long long)bestResult);
+                } else {
+                    LOG_INFO("[%s] %s: Unique match -> 0x%llX",
+                             report.targetName, sig->id,
+                             (unsigned long long)bestResult);
+                }
+
+                auto totalUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::high_resolution_clock::now() - batchT0).count();
+                LOG_INFO("[%s] AOB scan total: %lld us (%d batches, winner in batch %d)",
+                         report.targetName, static_cast<long long>(totalUs),
+                         batchIdx + 1, batchIdx + 1);
+
+                report.finalAddress = bestResult;
+                report.scanAddr = bestMatchAddr;
+                report.winningId = sig->id;
+                report.winningSig = sig;
+                return bestResult;
+            }
+
+            LOG_INFO("[%s] %s: %d match(es), none validated",
+                     report.targetName, sig->id, pr.hitCount);
+        }
+
+        // Pass 2: multi-module fallback for zero-hit patterns
+        if (tryMultiModule) {
+            for (int j = 0; j < batchCount; ++j) {
+                if (!batchResults[j].matches.empty()) continue; // processed in pass 1
+
+                const AobSignature* sig = aobPatterns[batchStart + j];
+                g_validationDbgCount = 0;
+
+                auto multiMatches = Mem::AOBScanAllModules(sig->pattern);
+
+                PatternScanResult pr;
+                pr.id = sig->id;
+                pr.hitCount = static_cast<int>(multiMatches.size());
+
+                if (multiMatches.empty()) {
+                    report.results.push_back(pr);
+                    continue;
+                }
+
+                uintptr_t bestResult = 0;
+                uintptr_t bestMatchAddr = 0;
+                for (uintptr_t matchAddr : multiMatches) {
+                    uintptr_t resolved = TryResolveMatch(matchAddr, *sig, validate);
+                    if (resolved) {
+                        bestResult = resolved;
+                        bestMatchAddr = matchAddr;
+                        break;
+                    }
+                }
+
+                if (g_validationDbgCount > kMaxValidationDbgLogs) {
+                    LOG_INFO("[%s] %s: Validation debug output throttled (%d entries, showed first %d)",
+                             report.targetName, sig->id, g_validationDbgCount, kMaxValidationDbgLogs);
+                }
+
+                pr.selected = bestResult;
+                pr.validated = (bestResult != 0);
+                report.results.push_back(pr);
+
+                if (bestResult) {
+                    if (pr.hitCount > 1) {
+                        LOG_INFO("[%s] %s: %d matches (multi-module), validated -> 0x%llX",
+                                 report.targetName, sig->id, pr.hitCount,
+                                 (unsigned long long)bestResult);
+                    } else {
+                        LOG_INFO("[%s] %s: Unique match (multi-module) -> 0x%llX",
+                                 report.targetName, sig->id,
+                                 (unsigned long long)bestResult);
+                    }
+
+                    auto totalUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::high_resolution_clock::now() - batchT0).count();
+                    LOG_INFO("[%s] AOB scan total: %lld us (%d batches, winner in batch %d, multi-module)",
+                             report.targetName, static_cast<long long>(totalUs),
+                             batchIdx + 1, batchIdx + 1);
+
+                    report.finalAddress = bestResult;
+                    report.scanAddr = bestMatchAddr;
+                    report.winningId = sig->id;
+                    report.winningSig = sig;
+                    return bestResult;
+                }
+
+                LOG_INFO("[%s] %s: %d match(es) (multi-module), none validated",
+                         report.targetName, sig->id, pr.hitCount);
+            }
+        } else {
+            // Record zero-hit patterns for report (no multi-module)
+            for (int j = 0; j < batchCount; ++j) {
+                if (!batchResults[j].matches.empty()) continue;
+                PatternScanResult pr;
+                pr.id = aobPatterns[batchStart + j]->id;
+                report.results.push_back(pr);
+            }
+        }
+    }
+
+    auto totalUs = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::high_resolution_clock::now() - batchT0).count();
+    LOG_INFO("[%s] AOB scan exhausted: %lld us (%d patterns in %d batches, no winner)",
+             report.targetName, static_cast<long long>(totalUs), totalAob, totalBatches);
+
+    return 0;
+}
+
+// Log the scan report summary and per-pattern details for analysis.
+// Output goes to scan.log for post-mortem diagnosis.
+// Extract summary stats from a ScanReport for EnginePointers propagation.
+static void ExtractScanStats(const ScanReport& report, int& triedCount, int& hitCount) {
+    triedCount = static_cast<int>(report.results.size());
+    hitCount = 0;
+    for (const auto& r : report.results) {
+        if (r.hitCount > 0) ++hitCount;
+    }
+}
+
+static void LogScanReport(const ScanReport& report) {
+    int totalPatterns = static_cast<int>(report.results.size());
+    int patternsWithHits = 0;
+    int patternsValidated = 0;
+    for (auto& r : report.results) {
+        if (r.hitCount > 0) ++patternsWithHits;
+        if (r.validated) ++patternsValidated;
+    }
+
+    // Summary line
+    if (report.finalAddress) {
+        Logger::Info("SCAN", "=== %s: %d patterns tried, %d with hits, winner: %s -> 0x%llX%s ===",
+                 report.targetName, totalPatterns, patternsWithHits,
+                 report.winningId ? report.winningId : "?",
+                 (unsigned long long)report.finalAddress,
+                 report.hintUsed ? " (hint)" : "");
+    } else {
+        Logger::Warn("SCAN", "=== %s: %d patterns tried, %d with hits, NONE validated ===",
+                 report.targetName, totalPatterns, patternsWithHits);
+    }
+
+    // Per-pattern detail: list all patterns with hits (INFO) and 0-hit (DEBUG)
+    for (auto& r : report.results) {
+        if (r.validated) {
+            Logger::Info("SCAN", "  [%s] %-16s hits=%-4d -> 0x%llX  [WINNER]",
+                     report.targetName, r.id, r.hitCount,
+                     (unsigned long long)r.selected);
+        } else if (r.hitCount > 0) {
+            Logger::Info("SCAN", "  [%s] %-16s hits=%-4d  (not validated)",
+                     report.targetName, r.id, r.hitCount);
+        } else {
+            Logger::Debug("SCAN", "  [%s] %-16s hits=0",
+                      report.targetName, r.id);
+        }
+    }
+}
+
+// ============================================================
+// Scan method tracking — set by each Find function, read by FindAll()
+// ============================================================
+static const char* s_gobjectsMethod = "not_found";
+static const char* s_gnamesMethod   = "not_found";
+static const char* s_gworldMethod   = "not_found";
+
+// File-scope ScanReports — promoted from local so FindAll() can read winningId + stats
+static ScanReport s_gobjectsReport;
+static ScanReport s_gnamesReport;
+static ScanReport s_gworldReport;
+
+// ============================================================
+// FindGObjects — unified scan + data-section fallback
+// ============================================================
+
+uintptr_t FindGObjects(const char* hintPatternId) {
+    s_gobjectsMethod = "not_found";
+    Logger::Info("SCAN:GObj", "FindGObjects: Scanning for GObjects...");
+
+    s_gobjectsReport = ScanReport{};
+    ScanReport& report = s_gobjectsReport;
+    report.targetName = "GObjects";
+
+    uintptr_t result = ScanForTarget(
+        Sig::GOBJECTS_PATTERNS, std::size(Sig::GOBJECTS_PATTERNS),
+        ValidateGObjects, report, /*tryMultiModule=*/true, hintPatternId);
+
+    LogScanReport(report);
+
+    if (result) {
+        s_gobjectsMethod = "aob";
+    } else {
+        // Fallback: exhaustive data-section pointer scan
+        Logger::Warn("SCAN:GObj", "FindGObjects: All patterns failed, trying data-section scan fallback...");
+        result = FindGObjectsByDataScan();
+        if (result) s_gobjectsMethod = "data_scan";
+    }
+
+    if (!result) {
+        Logger::Error("SCAN:GObj", "FindGObjects: All patterns and fallback scan failed");
+    }
+    return result;
+}
+
+// Validate GNames by checking that FName[0] == "None".
+//
+// The AOB pattern resolves to the FNamePool object address. The Blocks[]
+// chunk pointer array lives INSIDE FNamePool at a variable offset:
+//
+//   Standard UE5 layout (FNameEntryAllocator):
+//     [+0x00] FRWLock (SRWLOCK, 8 bytes)   ← reading this as chunk0 gives bad pointer
+//     [+0x08] CurrentBlock  (uint32)
+//     [+0x0C] CurrentByteCursor (uint32)
+//     [+0x10] Blocks[0]  ← first actual chunk pointer
+//
+// We try multiple offsets so the validator works across engine variants.
+static bool ValidateGNames(uintptr_t addr) {
+    if (!addr) return false;
+
+    // Offsets to try for the start of the Blocks[] array within FNamePool.
+    // 0x10 is the standard UE5 offset; 0x00 covers builds where the AOB
+    // resolves directly to the chunk array rather than the pool object.
+    static const int kOffsets[] = { 0x10, 0x00, 0x08, 0x18, 0x20, 0x28, 0x40 };
+
+    for (int off : kOffsets) {
+        uintptr_t chunk0 = 0;
+        if (!Mem::ReadSafe(addr + off, chunk0) || chunk0 == 0) continue;
+
+        // Try two header layouts:
+        //   (A) Standard: 2-byte header at chunk0+0, string at chunk0+2
+        //   (B) Hash-prefixed (UE4.26): 4-byte hash at chunk0+0, 2-byte header at chunk0+4, string at chunk0+6
+        // For each layout, try both Format A (len = header >> 6) and Format B (len = (header >> 1) & 0x7FF)
+
+        auto tryHeaderAt = [&](int hdrOff) -> bool {
+            uint16_t header = 0;
+            if (!Mem::ReadSafe(chunk0 + hdrOff, header)) return false;
+
+            char name[5] = {};
+            int lenA = header >> 6;
+            if (lenA == 4 && Mem::ReadBytesSafe(chunk0 + hdrOff + 2, name, 4) && strcmp(name, "None") == 0) {
+                g_fnameEntryHeaderOffset = hdrOff;
+                Logger::Info("SCAN:GNam", "ValidateGNames: Valid at 0x%llX (chunks@+0x%02X, hdrOff=%d, FmtA, 'None')",
+                         static_cast<unsigned long long>(addr), off, hdrOff);
+                return true;
+            }
+            memset(name, 0, sizeof(name));
+            int lenB = (header >> 1) & 0x7FF;
+            if (lenB == 4 && Mem::ReadBytesSafe(chunk0 + hdrOff + 2, name, 4) && strcmp(name, "None") == 0) {
+                g_fnameEntryHeaderOffset = hdrOff;
+                Logger::Info("SCAN:GNam", "ValidateGNames: Valid at 0x%llX (chunks@+0x%02X, hdrOff=%d, FmtB, 'None')",
+                         static_cast<unsigned long long>(addr), off, hdrOff);
+                return true;
+            }
+
+            if (g_validationDbgCount++ < kMaxValidationDbgLogs)
+                Logger::Debug("SCAN:GNam", "ValidateGNames: offset +0x%02X hdrOff=%d chunk0=0x%llX header=0x%04X lenA=%d lenB=%d name='%.4s'",
+                          off, hdrOff, static_cast<unsigned long long>(chunk0), header, lenA, lenB, name);
+            return false;
+        };
+
+        // Standard layout: header at +0
+        if (tryHeaderAt(0)) return true;
+        // Hash-prefixed layout: 4-byte ComparisonId then 2-byte header at +4
+        if (tryHeaderAt(4)) return true;
+    }
+
+    // Dump the first 128 bytes so we can diagnose the layout manually
+    if (g_validationDbgCount++ < kMaxValidationDbgLogs) {
+        char hexbuf[256];
+        int pos = 0;
+        for (int i = 0; i < 128 && pos < 200; i += 8) {
+            uintptr_t v = 0;
+            if (Mem::ReadSafe(addr + i, v))
+                pos += snprintf(hexbuf + pos, sizeof(hexbuf) - pos,
+                                " +%02X:%016llX", i, (unsigned long long)v);
+            else
+                pos += snprintf(hexbuf + pos, sizeof(hexbuf) - pos, " +%02X:[??]", i);
+        }
+        Logger::Debug("SCAN:GNam", "ValidateGNames: dump@0x%llX:%s",
+                  (unsigned long long)addr, hexbuf);
+    }
+    if (g_validationDbgCount <= kMaxValidationDbgLogs)
+        Logger::Warn("SCAN:GNam", "ValidateGNames: Validation failed at 0x%llX", static_cast<unsigned long long>(addr));
+    return false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FindGNamesByPointerScan — fallback when all AOB patterns fail
+//
+// Strategy:
+//   The FNamePool object lives in the game's .data / .bss section and contains
+//   an internal Blocks[] array (at a variable offset, typically +0x10).
+//   Blocks[0] is a pointer to a heap-allocated chunk whose very first bytes
+//   are the "None" FNameEntry (the #0 name in FNamePool).
+//
+//   By scanning the game module's writable, non-exec sections for any 8-byte-
+//   aligned pointer that dereferences to a "None" FNameEntry, we can locate
+//   Blocks[0] and work backwards to the FNamePool base address.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Corroborate a FNamePool chunk by checking for common UE type name strings.
+// Real FNamePool Blocks[0] always contains fundamental type names ("ByteProperty",
+// "IntProperty", "Object", "Class", etc.) within the first 2048 bytes.
+// Random heap data containing "None" won't also have these UE-specific strings.
+static bool CorroborateFNameChunk(uintptr_t chunkAddr) {
+    // Read first 2048 bytes of the chunk
+    constexpr int kScanSize = 2048;
+    uint8_t buf[kScanSize];
+    if (!Mem::ReadBytesSafe(chunkAddr, buf, kScanSize)) return false;
+
+    // Look for at least 2 of these UE type names within the chunk
+    const char* markers[] = { "Property", "Object", "Struct", "Class", "Package", "Function" };
+    int found = 0;
+    for (const char* marker : markers) {
+        size_t mlen = strlen(marker);
+        for (int i = 0; i + (int)mlen <= kScanSize; ++i) {
+            if (memcmp(buf + i, marker, mlen) == 0) {
+                ++found;
+                break;  // Only count each marker once
+            }
+        }
+        if (found >= 2) return true;  // Early exit
+    }
+    return false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UE4 TNameEntryArray validation
+//
+// UE4 <4.23 uses TNameEntryArray instead of FNamePool:
+//   TNameEntryArray = array of chunk pointers
+//   Each chunk = array of FNameEntry* pointers (up to 0x4000 entries per chunk)
+//   FNameEntry has a null-terminated string at a fixed offset (+0x10 for UE4.14-4.22, +0x06 for older)
+//
+// Double-dereference: arrayBase[0] → chunkPtr → entry0Ptr → FNameEntry with "None"
+// ─────────────────────────────────────────────────────────────────────────────
+static bool ValidateGNamesUE4(uintptr_t addr, int& outStringOffset) {
+    if (!addr) return false;
+
+    // Read first chunk pointer: TNameEntryArray[0]
+    uintptr_t chunk0Ptr = 0;
+    if (!Mem::ReadSafe(addr, chunk0Ptr) || !chunk0Ptr) return false;
+    if (chunk0Ptr < 0x10000 || chunk0Ptr > 0x00007FFFFFFFFFFF) return false;
+
+    // chunk0Ptr points to an array of FNameEntry* pointers
+    // Read chunk0[0] = first FNameEntry*
+    uintptr_t entry0 = 0;
+    if (!Mem::ReadSafe(chunk0Ptr, entry0) || !entry0) return false;
+    if (entry0 < 0x10000 || entry0 > 0x00007FFFFFFFFFFF) return false;
+
+    // Try reading "None" at common UE4 FNameEntry string offsets
+    int offsets[] = { 0x10, 0x06, 0x0C, 0x08 };
+    for (int strOff : offsets) {
+        char name[5] = {};
+        if (!Mem::ReadBytesSafe(entry0 + strOff, name, 4)) continue;
+        if (strcmp(name, "None") != 0) continue;
+
+        // Corroborate: entry at index 1 should also be a valid pointer with ASCII string
+        uintptr_t entry1 = 0;
+        if (!Mem::ReadSafe(chunk0Ptr + 8, entry1) || entry1 < 0x10000) continue;
+
+        char name1[8] = {};
+        if (!Mem::ReadBytesSafe(entry1 + strOff, name1, 7)) continue;
+
+        bool valid = true;
+        for (int i = 0; i < 7 && name1[i]; ++i) {
+            auto c = static_cast<unsigned char>(name1[i]);
+            if (c < 0x20 || c >= 0x7F) { valid = false; break; }
+        }
+        if (!valid) continue;
+
+        // Extra corroboration: entry at index 2 should also be valid
+        uintptr_t entry2 = 0;
+        if (Mem::ReadSafe(chunk0Ptr + 16, entry2) && entry2 > 0x10000) {
+            char name2[8] = {};
+            if (Mem::ReadBytesSafe(entry2 + strOff, name2, 7)) {
+                bool valid2 = true;
+                for (int i = 0; i < 7 && name2[i]; ++i) {
+                    auto c = static_cast<unsigned char>(name2[i]);
+                    if (c < 0x20 || c >= 0x7F) { valid2 = false; break; }
+                }
+                if (!valid2) continue;
+            }
+        }
+
+        outStringOffset = strOff;
+        Logger::Info("SCAN:GNam", "ValidateGNamesUE4: Valid TNameEntryArray at 0x%llX "
+                 "(strOff=0x%X, entry[0]='None', entry[1]='%.7s')",
+                 (unsigned long long)addr, strOff, name1);
+        return true;
+    }
+
+    return false;
+}
+
+// Return true if the memory at `addr` starts with a "None" FNameEntry.
+// The FNameEntry header is 2 bytes (all known UE5 versions), followed by the
+// name string.  Instead of checking specific header values (which vary across
+// UE versions), we just look for ASCII "None" at offset +2.
+// Also checks offset +4 in case a future build uses a 4-byte header.
+static bool LooksLikeNoneEntry(uintptr_t addr) {
+    // Read enough bytes to check all known header layouts:
+    //   +2: standard 2-byte header
+    //   +4: potential 4-byte header variant
+    //   +6: UE4.26 hash-prefixed (4-byte hash + 2-byte header)
+    uint8_t buf[10] = {};
+    if (!Mem::ReadBytesSafe(addr, buf, 10)) return false;
+
+    // Standard 2-byte header: "None" at offset +2
+    if (buf[2] == 'N' && buf[3] == 'o' && buf[4] == 'n' && buf[5] == 'e')
+        return true;
+
+    // Potential 4-byte header variant: "None" at offset +4
+    if (buf[4] == 'N' && buf[5] == 'o' && buf[6] == 'n' && buf[7] == 'e')
+        return true;
+
+    // UE4.26 hash-prefixed: 4-byte ComparisonId + 2-byte header, "None" at offset +6
+    if (buf[6] == 'N' && buf[7] == 'o' && buf[8] == 'n' && buf[9] == 'e')
+        return true;
+
+    return false;
+}
+
+static uintptr_t FindGNamesByPointerScan() {
+    Logger::Info("SCAN:GNam", "FindGNamesByPointerScan: Scanning .data for pointer-to-'None' FNameEntry...");
+
+    uintptr_t base = Mem::GetModuleBase(nullptr);
+    if (!base) return 0;
+
+    auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+
+    auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
+        base + static_cast<DWORD>(dos->e_lfanew));
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+
+    const IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
+    size_t modSize = Mem::GetModuleSize(nullptr);
+
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+        // Target: writable, non-executable sections (.data / .bss).
+        // FNamePool is a static global — its Blocks[] array lives here.
+        constexpr DWORD kWrite = IMAGE_SCN_MEM_WRITE;
+        constexpr DWORD kExec  = IMAGE_SCN_MEM_EXECUTE;
+        if (!(section->Characteristics & kWrite)) continue;
+        if (  section->Characteristics & kExec ) continue;
+        if (!section->Misc.VirtualSize || !section->VirtualAddress) continue;
+
+        uintptr_t secBase = base + section->VirtualAddress;
+        size_t    secSize = section->Misc.VirtualSize;
+
+        char secName[9] = {};
+        memcpy(secName, section->Name, 8);
+        Logger::Debug("SCAN:GNam", "FindGNamesByPointerScan: Scanning section [%s] at 0x%llX (%zu bytes)",
+                  secName, (unsigned long long)secBase, secSize);
+
+        // Walk every 8-byte-aligned slot and treat it as a potential pointer.
+        int diagCount = 0;  // Limit diagnostic dumps to first few candidates
+        for (size_t off = 0; off + 8 <= secSize; off += 8) {
+            uintptr_t ptr = 0;
+            if (!Mem::ReadSafe(secBase + off, ptr)) continue;
+
+            // Plausible user-space 64-bit address (exclude null, low, kernel)
+            if (ptr < 0x10000 || ptr > 0x00007FFFFFFFFFFF) continue;
+
+            // Skip if ptr lives inside the game module itself (not a heap chunk)
+            if (ptr >= base && ptr < base + modSize) continue;
+
+            // Check if ptr dereferences to a "None" FNameEntry
+            if (!LooksLikeNoneEntry(ptr)) {
+                // Near-miss diagnostic: check if "None" appears anywhere in first 16 bytes
+                // This catches unknown header formats we didn't account for
+                if (diagCount < 10) {
+                    uint8_t peek[16] = {};
+                    if (Mem::ReadBytesSafe(ptr, peek, 16)) {
+                        for (int p = 0; p + 4 <= 16; ++p) {
+                            if (peek[p] == 'N' && peek[p+1] == 'o' && peek[p+2] == 'n' && peek[p+3] == 'e') {
+                                Logger::Warn("SCAN:GNam", "FindGNamesByPointerScan: NEAR-MISS 'None' at ptr=0x%llX offset=%d "
+                                         "header=%02X%02X%02X%02X bytes=%02X %02X %02X %02X %02X %02X %02X %02X "
+                                         "%02X %02X %02X %02X %02X %02X %02X %02X (.data+0x%zX)",
+                                         (unsigned long long)ptr, p,
+                                         peek[0], peek[1], peek[2], peek[3],
+                                         peek[0], peek[1], peek[2], peek[3], peek[4], peek[5], peek[6], peek[7],
+                                         peek[8], peek[9], peek[10], peek[11], peek[12], peek[13], peek[14], peek[15],
+                                         off);
+                                ++diagCount;
+                                break;
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Found: ptr = chunk0 = FNamePool.Blocks[0]
+            // pAddr  = secBase + off  = &FNamePool.Blocks[0] (in .data)
+            // FNamePool base = pAddr − (offset of Blocks[0] within FNamePool)
+            uintptr_t pAddr = secBase + off;
+
+            Logger::Info("SCAN:GNam", "FindGNamesByPointerScan: chunk0=0x%llX @ 0x%llX — corroborating...",
+                     (unsigned long long)ptr, (unsigned long long)pAddr);
+
+            // Corroborate: real FNamePool chunks contain UE type names
+            if (!CorroborateFNameChunk(ptr)) {
+                Logger::Debug("SCAN:GNam", "FindGNamesByPointerScan: Corroboration failed — skipping");
+                continue;
+            }
+
+            // Dump what the candidate actually points to for diagnostics
+            if (diagCount < 5) {
+                char hexbuf[64] = {};
+                uint8_t peek[16] = {};
+                if (Mem::ReadBytesSafe(ptr, peek, 16)) {
+                    snprintf(hexbuf, sizeof(hexbuf),
+                             "%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                             peek[0], peek[1], peek[2], peek[3], peek[4], peek[5], peek[6], peek[7],
+                             peek[8], peek[9], peek[10], peek[11], peek[12], peek[13], peek[14], peek[15]);
+                }
+                Logger::Debug("SCAN:GNam", "FindGNamesByPointerScan: candidate chunk0 bytes: %s", hexbuf);
+                ++diagCount;
+            }
+
+            // Try common offsets of Blocks[0] within FNamePool:
+            //   0x10 = standard UE5 (FRWLock[8] + CurrentBlock[4] + Cursor[4])
+            //   0x00, 0x08, 0x18, 0x20, 0x28 = observed variants
+            for (int blkOff : { 0x10, 0x00, 0x08, 0x18, 0x20, 0x28 }) {
+                if ((size_t)blkOff > pAddr) continue; // underflow guard
+                uintptr_t pool = pAddr - static_cast<uintptr_t>(blkOff);
+                if (ValidateGNames(pool) || ValidateGNamesStructural(pool)) {
+                    Logger::Info("SCAN:GNam", "FindGNamesByPointerScan: Valid pool at 0x%llX (Blocks[0]@+0x%02X)",
+                             (unsigned long long)pool, blkOff);
+                    return pool;
+                }
+            }
+        }
+    }
+
+    Logger::Warn("SCAN:GNam", "FindGNamesByPointerScan: No valid FNamePool found in .data");
+    return 0;
+}
+
+// Unified GNames validation: tries FNamePool validators first, then UE4 TNameEntryArray.
+// Sets g_isUE4NameArray and g_ue4NameStringOffset if UE4 mode is detected.
+static bool ValidateGNamesAny(uintptr_t addr) {
+    if (ValidateGNames(addr)) return true;
+    if (ValidateGNamesStructural(addr)) return true;
+    int strOff = 0;
+    if (ValidateGNamesUE4(addr, strOff)) {
+        g_isUE4NameArray = true;
+        g_ue4NameStringOffset = strOff;
+        return true;
+    }
+    return false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FindGNamesByStringRef — fallback: search .rdata for a known UE string
+// literal, find XREF in .text (LEA pointing to it), then scan nearby code
+// for LEA reg,[rip+disp] instructions that load FNamePool address.
+//
+// Strategy: The FName constructor is called with string literals like
+// "ForwardShadingQuality_" or "bInitializedSerializeFromMismatchedTag".
+// The call site typically has:
+//   LEA rcx, [rip+FNamePool]    ; load FNamePool address
+//   LEA rdx, [rip+StringLit]    ; load the string literal
+//   CALL FName::Init / FName::FName
+//
+// We find the string literal XREF, then scan ±0x60 bytes around it for
+// another LEA that resolves to a valid FNamePool in the .data section.
+//
+// Source: Dumper-7 UnrealTypes.cpp:69-204 (adapted approach)
+// ─────────────────────────────────────────────────────────────────────────────
+static uintptr_t FindGNamesByStringRef() {
+    Logger::Info("SCAN:GNam", "FindGNamesByStringRef: Searching for string-ref to FNamePool...");
+
+    uintptr_t base = Mem::GetModuleBase(nullptr);
+    if (!base) return 0;
+    size_t modSize = Mem::GetModuleSize(nullptr);
+    if (!modSize) return 0;
+
+    auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
+        base + static_cast<DWORD>(dos->e_lfanew));
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+
+    // Locate .text (code), .rdata (read-only), and .data (writable) sections
+    const IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
+    uintptr_t codeStart = 0, codeEnd = 0;
+    uintptr_t rdataStart = 0, rdataEnd = 0;
+    uintptr_t dataStart = 0, dataEnd = 0;
+
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+        if (!section->Misc.VirtualSize || !section->VirtualAddress) continue;
+        uintptr_t secBase = base + section->VirtualAddress;
+        uintptr_t secEnd  = secBase + section->Misc.VirtualSize;
+
+        if (section->Characteristics & IMAGE_SCN_MEM_EXECUTE) {
+            if (!codeStart || secBase < codeStart) codeStart = secBase;
+            if (secEnd > codeEnd) codeEnd = secEnd;
+        } else if (!(section->Characteristics & IMAGE_SCN_MEM_WRITE) &&
+                   !(section->Characteristics & IMAGE_SCN_MEM_EXECUTE)) {
+            // Read-only, non-executable = .rdata
+            if (!rdataStart || secBase < rdataStart) rdataStart = secBase;
+            if (secEnd > rdataEnd) rdataEnd = secEnd;
+        } else if ((section->Characteristics & IMAGE_SCN_MEM_WRITE) &&
+                   !(section->Characteristics & IMAGE_SCN_MEM_EXECUTE)) {
+            // Writable, non-exec = .data (where FNamePool lives)
+            if (!dataStart) { dataStart = secBase; dataEnd = secEnd; }
+        }
+    }
+
+    if (!codeStart || !rdataStart || !dataStart) {
+        Logger::Debug("SCAN:GNam", "FindGNamesByStringRef: Could not identify required sections");
+        return 0;
+    }
+
+    Logger::Debug("SCAN:GNam", "FindGNamesByStringRef: code=[0x%llX-0x%llX], rdata=[0x%llX-0x%llX], data=[0x%llX-0x%llX]",
+              (unsigned long long)codeStart, (unsigned long long)codeEnd,
+              (unsigned long long)rdataStart, (unsigned long long)rdataEnd,
+              (unsigned long long)dataStart, (unsigned long long)dataEnd);
+
+    // Known UE string literals used near FName construction sites.
+    // We search for each in .rdata, then find XREFs from .text.
+    const char* markerStrings[] = {
+        "ForwardShadingQuality_",
+        "bInitializedSerializeFromMismatchedTag",
+        "NameProperty",
+    };
+
+    for (const char* marker : markerStrings) {
+        size_t markerLen = strlen(marker);
+
+        // Search .rdata for the ASCII string
+        for (uintptr_t scan = rdataStart; scan + markerLen < rdataEnd; ++scan) {
+            char buf[64] = {};
+            size_t readLen = (markerLen < 63) ? markerLen + 1 : 63;
+            if (!Mem::ReadBytesSafe(scan, buf, readLen)) continue;
+            if (memcmp(buf, marker, markerLen) != 0) continue;
+
+            // Verify null-termination (exact match, not substring)
+            if (readLen > markerLen && buf[markerLen] != '\0') { scan += markerLen; continue; }
+
+            Logger::Debug("SCAN:GNam", "FindGNamesByStringRef: Found '%s' at 0x%llX",
+                      marker, (unsigned long long)scan);
+
+            // Scan .text for LEA reg,[rip+disp32] that resolve to 'scan'.
+            // LEA opcodes: {48,4C} 8D {05,0D,15,1D,25,2D,35,3D} disp32
+            int xrefCount = 0;
+            for (uintptr_t cs = codeStart; cs + 7 < codeEnd && xrefCount < 8; ++cs) {
+                uint8_t b0 = 0, b1 = 0, b2 = 0;
+                if (!Mem::ReadSafe(cs, b0)) continue;
+                if (b0 != 0x48 && b0 != 0x4C) continue;
+                if (!Mem::ReadSafe(cs + 1, b1)) continue;
+                if (b1 != 0x8D) continue;
+                if (!Mem::ReadSafe(cs + 2, b2)) continue;
+                if ((b2 & 0x07) != 0x05) continue;  // RIP-relative
+                if ((b2 & 0xC0) != 0x00) continue;
+
+                int32_t disp = 0;
+                if (!Mem::ReadSafe(cs + 3, disp)) continue;
+                uintptr_t resolved = cs + 7 + static_cast<int64_t>(disp);
+                if (resolved != scan) continue;
+
+                // Found XREF at 'cs'. Scan ±0x60 bytes around it for
+                // another LEA that resolves to a .data address (FNamePool candidate).
+                ++xrefCount;
+                Logger::Debug("SCAN:GNam", "FindGNamesByStringRef: XREF #%d at 0x%llX",
+                          xrefCount, (unsigned long long)cs);
+
+                uintptr_t searchStart = (cs > codeStart + 0x60) ? cs - 0x60 : codeStart;
+                uintptr_t searchEnd   = (cs + 0x60 < codeEnd)   ? cs + 0x60 : codeEnd;
+
+                for (uintptr_t ns = searchStart; ns + 7 < searchEnd; ++ns) {
+                    if (ns == cs) continue;  // Skip the string XREF itself
+
+                    uint8_t n0 = 0, n1 = 0, n2 = 0;
+                    if (!Mem::ReadSafe(ns, n0)) continue;
+                    if (n0 != 0x48 && n0 != 0x4C) continue;
+                    if (!Mem::ReadSafe(ns + 1, n1)) continue;
+                    if (n1 != 0x8D) continue;
+                    if (!Mem::ReadSafe(ns + 2, n2)) continue;
+                    if ((n2 & 0x07) != 0x05) continue;
+                    if ((n2 & 0xC0) != 0x00) continue;
+
+                    int32_t ndisp = 0;
+                    if (!Mem::ReadSafe(ns + 3, ndisp)) continue;
+                    uintptr_t candidate = ns + 7 + static_cast<int64_t>(ndisp);
+
+                    // Must resolve to the data section
+                    if (candidate < dataStart || candidate >= dataEnd) continue;
+
+                    // Validate as FNamePool
+                    if (ValidateGNamesAny(candidate)) {
+                        Logger::Info("SCAN:GNam", "FindGNamesByStringRef: Valid FNamePool at 0x%llX "
+                                 "(via '%s' XREF at 0x%llX, LEA at 0x%llX)",
+                                 (unsigned long long)candidate, marker,
+                                 (unsigned long long)cs, (unsigned long long)ns);
+                        return candidate;
+                    }
+                }
+            }
+
+            // Only check first occurrence of each marker string
+            break;
+        }
+    }
+
+    Logger::Debug("SCAN:GNam", "FindGNamesByStringRef: No FNamePool found via string references");
+    return 0;
+}
+
+uintptr_t FindGNames(const char* hintPatternId) {
+    s_gnamesMethod = "not_found";
+    // Reset detection state for each scan attempt
+    g_isUE4NameArray = false;
+    g_ue4NameStringOffset = 0x10;
+    g_fnameEntryHeaderOffset = 0;
+
+    Logger::Info("SCAN:GNam", "FindGNames: Scanning for GNames (FNamePool / TNameEntryArray)...");
+
+    s_gnamesReport = ScanReport{};
+    ScanReport& report = s_gnamesReport;
+    report.targetName = "GNames";
+
+    uintptr_t result = ScanForTarget(
+        Sig::GNAMES_PATTERNS, std::size(Sig::GNAMES_PATTERNS),
+        ValidateGNamesAny, report, /*tryMultiModule=*/true, hintPatternId);
+
+    LogScanReport(report);
+
+    if (result) {
+        s_gnamesMethod = "aob";
+    } else {
+        // Tier 2: string-reference fallback — find FNamePool via code that uses FName
+        Logger::Warn("SCAN:GNam", "FindGNames: All patterns failed, trying string-ref fallback...");
+        result = FindGNamesByStringRef();
+        if (result) {
+            s_gnamesMethod = "string_ref";
+        } else {
+            // Tier 3: data-pointer scan — brute-force .data for "None" chunk pointers
+            Logger::Warn("SCAN:GNam", "FindGNames: String-ref failed, trying pointer scan fallback...");
+            result = FindGNamesByPointerScan();
+            if (result) s_gnamesMethod = "pointer_scan";
+        }
+    }
+
+    if (!result) {
+        Logger::Error("SCAN:GNam", "FindGNames: All patterns and fallbacks failed");
+    }
+    return result;
+}
+
+// Basic GWorld validator for use with ScanForTarget.
+// GWorld validation is simpler than GObjects/GNames — we just check that the
+// address is readable and, if the pointer is non-null, it looks like a valid
+// heap pointer.  The gworldAllowNull flag in AobSignature controls whether
+// null UWorld* values are accepted (handled in TryResolveMatch).
+static bool ValidateGWorldBasic(uintptr_t addr) {
+    if (!addr) return false;
+    uintptr_t world = 0;
+    if (!Mem::ReadSafe(addr, world)) return false;
+    // A null world is acceptable (write-patterns at startup) — the null
+    // filtering is already handled by TryResolveMatch via gworldAllowNull.
+    // Here we just accept any readable address.
+    if (world == 0) return true;
+    return LooksLikeDataPtr(world);
+}
+
+uintptr_t FindGWorld(const char* hintPatternId) {
+    s_gworldMethod = "not_found";
+    Logger::Info("SCAN:GWld", "FindGWorld: Scanning for GWorld...");
+
+    s_gworldReport = ScanReport{};
+    ScanReport& report = s_gworldReport;
+    report.targetName = "GWorld";
+
+    uintptr_t result = ScanForTarget(
+        Sig::GWORLD_PATTERNS, std::size(Sig::GWORLD_PATTERNS),
+        ValidateGWorldBasic, report, /*tryMultiModule=*/true, hintPatternId);
+
+    LogScanReport(report);
+
+    if (result) {
+        s_gworldMethod = "aob";
+    } else {
+        Logger::Warn("SCAN:GWld", "FindGWorld: All patterns failed (non-critical)");
+    }
+    return result;
+}
+
+// Fast O(1) version detection via PE VERSIONINFO resource.
+// UE games embed the engine version in their VS_FIXEDFILEINFO.dwProductVersion:
+//   HIWORD(dwProductVersionMS) = major (5 for UE5)
+//   LOWORD(dwProductVersionMS) = minor (0-4 for UE 5.0-5.4)
+static uint32_t DetectVersionFromPEResource() {
+    wchar_t exePath[MAX_PATH] = {};
+    if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH)) return 0;
+
+    DWORD handle = 0;
+    DWORD infoSize = GetFileVersionInfoSizeW(exePath, &handle);
+    if (!infoSize) return 0;
+
+    std::vector<uint8_t> buf(infoSize);
+    if (!GetFileVersionInfoW(exePath, handle, infoSize, buf.data())) return 0;
+
+    VS_FIXEDFILEINFO* fi = nullptr;
+    UINT len = 0;
+    if (!VerQueryValueW(buf.data(), L"\\",
+                        reinterpret_cast<LPVOID*>(&fi), &len)) return 0;
+    if (!fi || len < sizeof(VS_FIXEDFILEINFO)) return 0;
+
+    uint32_t major = HIWORD(fi->dwProductVersionMS);
+    uint32_t minor = LOWORD(fi->dwProductVersionMS);
+
+    if (major == 5 && minor <= 9) {
+        Logger::Info("SCAN:Ver", "DetectVersion: PE VERSIONINFO -> UE %u.%u -> %u",
+                 major, minor, 500u + minor);
+        return 500u + minor;
+    }
+
+    // Some shippers put 4.x in the info (UE4 fork claiming UE5 classes)
+    if (major == 4 && minor <= 27) {
+        Logger::Info("SCAN:Ver", "DetectVersion: PE VERSIONINFO -> UE4.%u (treated as 400+minor)", minor);
+        return 400u + minor;
+    }
+
+    // Some shippers put UE version in FileVersion instead of ProductVersion
+    uint32_t fmajor = HIWORD(fi->dwFileVersionMS);
+    uint32_t fminor = LOWORD(fi->dwFileVersionMS);
+    if (fmajor == 5 && fminor <= 9) {
+        Logger::Info("SCAN:Ver", "DetectVersion: PE FileVersion -> UE %u.%u -> %u", fmajor, fminor, 500u + fminor);
+        return 500u + fminor;
+    }
+    if (fmajor == 4 && fminor <= 27) {
+        Logger::Info("SCAN:Ver", "DetectVersion: PE FileVersion -> UE4.%u (treated as 400+minor)", fminor);
+        return 400u + fminor;
+    }
+
+    Logger::Warn("SCAN:Ver", "DetectVersion: PE VERSIONINFO Product=%u.%u File=%u.%u — unrecognised",
+             major, minor, fmajor, fminor);
+    return 0;
+}
+
+uint32_t DetectVersion() {
+    Logger::Info("SCAN:Ver", "DetectVersion: Attempting to detect UE version...");
+
+    // Fast path: read the PE VERSIONINFO resource (O(1), no memory scan)
+    uint32_t ver = DetectVersionFromPEResource();
+    if (ver) return ver;
+
+    Logger::Warn("SCAN:Ver", "DetectVersion: PE resource failed, falling back to memory string scan");
+
+    // Slow path: scan for UE version strings embedded in the binary
+    uintptr_t base = Mem::GetModuleBase(nullptr);
+    size_t    size = Mem::GetModuleSize(nullptr);
+    if (!base || !size) {
+        Logger::Warn("SCAN:Ver", "DetectVersion: Cannot get module base");
+        return 0;
+    }
+
+    // Version string patterns to match (ordered by priority — newest first)
+    struct { const char* needle; uint32_t value; } patterns[] = {
+        { "5.7.", 507 }, { "5.6.", 506 }, { "5.5.", 505 },
+        { "5.4.", 504 }, { "5.3.", 503 }, { "5.2.", 502 },
+        { "5.1.", 501 }, { "5.0.", 500 },
+        { "4.27.", 427 }, { "4.26.", 426 }, { "4.25.", 425 },
+        { "4.24.", 424 }, { "4.23.", 423 }, { "4.22.", 422 },
+        { "4.21.", 421 }, { "4.20.", 420 }, { "4.19.", 419 },
+        { "4.18.", 418 },
+    };
+
+    const uint8_t* scan = reinterpret_cast<const uint8_t*>(base);
+
+    // === Tier 1: Exact UE build strings "++UE5+Release-5.X" / "++UE4+Release-4.XX" ===
+    // These are embedded in shipping UE builds and are the most reliable identifier.
+    {
+        const char* prefixes[] = { "++UE5+Release-", "++UE4+Release-" };
+        for (const char* prefix : prefixes) {
+            size_t prefixLen = strlen(prefix);
+            for (size_t off = 0; off + prefixLen + 4 < size; ++off) {
+                if (memcmp(scan + off, prefix, prefixLen) != 0) continue;
+                for (auto& p : patterns) {
+                    size_t needleLen = strlen(p.needle);
+                    if (off + prefixLen + needleLen <= size &&
+                        memcmp(scan + off + prefixLen, p.needle, needleLen) == 0) {
+                        Logger::Info("SCAN:Ver", "DetectVersion: Tier 1 '%s' -> %u at 0x%zX",
+                                 prefix, p.value, off);
+                        return p.value;
+                    }
+                }
+            }
+        }
+    }
+
+    // === Tier 2 + 3: Per-pattern scan with context checks ===
+    for (auto& p : patterns) {
+        size_t needleLen = strlen(p.needle);
+        for (size_t off = 0; off + needleLen + 10 < size; ++off) {
+            if (memcmp(scan + off, p.needle, needleLen) != 0) continue;
+
+            // Tier 2: "Release" prefix within the preceding 16 bytes
+            if (off >= 8) {
+                char ctx[17] = {};
+                memcpy(ctx, scan + off - 8, 8);
+                if (strstr(ctx, "Release") || strstr(ctx, "release")) {
+                    Logger::Info("SCAN:Ver", "DetectVersion: Tier 2 Release prefix -> %u at 0x%zX",
+                             p.value, off);
+                    return p.value;
+                }
+            }
+
+            // Tier 3: bare "X.Y.D" — only accept if preceding char is NOT a digit or period.
+            // This prevents matching game version strings like "15.6.0" or "v2.5.6.1".
+            if (scan[off + needleLen] >= '0' && scan[off + needleLen] <= '9') {
+                if (off > 0) {
+                    uint8_t prev = scan[off - 1];
+                    if ((prev >= '0' && prev <= '9') || prev == '.') {
+                        continue;  // Skip — likely a game version string, not UE version
+                    }
+                }
+                Logger::Info("SCAN:Ver", "DetectVersion: Tier 3 bare pattern -> %u at 0x%zX", p.value, off);
+                return p.value;
+            }
+        }
+    }
+
+    Logger::Warn("SCAN:Ver", "DetectVersion: Could not detect UE version from PE or memory");
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ValidateAndFixOffsets — Runtime FField/FProperty offset detection
+//
+// Strategy:
+//   1. Find well-known UScriptStruct "Guid" (has 4 int32 fields: A,B,C,D
+//      at offsets 0,4,8,12 respectively, all ElementSize=4)
+//   2. Walk from UStruct base to find ChildProperties pointer
+//   3. From first FField, probe for Name offset (where FName resolves to "A"/"D")
+//   4. Probe for Next pointer (leads to another FField with known name)
+//   5. Probe for FProperty::Offset_Internal (should be 0 for field "A", 4 for "B")
+//   6. Probe for FProperty::ElementSize (should be 4 for all Guid fields)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Helper: find a UScriptStruct by name via GObjects scan
+static uintptr_t FindStructByName(const char* structName) {
+    int32_t count = ObjectArray::GetCount();
+    for (int32_t i = 0; i < count; ++i) {
+        uintptr_t obj = ObjectArray::GetByIndex(i);
+        if (!obj) continue;
+
+        // Check class name == "ScriptStruct"
+        uintptr_t cls = 0;
+        if (!Mem::ReadSafe(obj + Constants::OFF_UOBJECT_CLASS, cls) || !cls) continue;
+
+        uint32_t clsNameIdx = 0;
+        if (!Mem::ReadSafe(cls + Constants::OFF_UOBJECT_NAME, clsNameIdx)) continue;
+        std::string clsName = FNamePool::GetString(clsNameIdx);
+        if (clsName != "ScriptStruct") continue;
+
+        // Check object name matches
+        uint32_t nameIdx = 0;
+        if (!Mem::ReadSafe(obj + Constants::OFF_UOBJECT_NAME, nameIdx)) continue;
+        std::string name = FNamePool::GetString(nameIdx);
+        if (name == structName) {
+            Logger::Info("DYNO", "FindStructByName: Found '%s' at 0x%llX (index=%d)",
+                     structName, (unsigned long long)obj, i);
+            return obj;
+        }
+    }
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DetectCasePreservingName — Measure FName size from UObject layout.
+//
+// Strategy (from Dumper-7 InitFNameSettings):
+//   Pick any UObject* from GObjects. Read the pointer at +0x20 (candidate Outer).
+//   If it's a valid pointer, FName is 8 bytes (standard), Outer=0x20.
+//   If not, try +0x28. If THAT is a valid pointer (or null for Package),
+//   FName is 0x10 bytes (CasePreservingName), Outer=0x28.
+//
+// Also checks: if the two int32s at UObject::Name (+0x18 and +0x1C) are equal,
+// it's likely ComparisonIndex == DisplayIndex, confirming CPN.
+// ─────────────────────────────────────────────────────────────────────────────
+static void DetectCasePreservingName() {
+    Logger::Info("DYNO", "DetectCasePreservingName: Probing UObject layout...");
+
+    // Collect a few UObjects to test consensus
+    int voteStandard = 0, voteCPN = 0;
+    int tested = 0;
+
+    int32_t count = ObjectArray::GetCount();
+    for (int32_t i = 1; i < count && tested < 20; ++i) {
+        uintptr_t obj = ObjectArray::GetByIndex(i);
+        if (!obj) continue;
+
+        // Read Class at +0x10 to confirm this is a valid UObject
+        uintptr_t cls = 0;
+        if (!Mem::ReadSafe(obj + Constants::OFF_UOBJECT_CLASS, cls) || !cls) continue;
+        if (cls < 0x10000 || cls > 0x00007FFFFFFFFFFF) continue;
+
+        // Read candidate Outer at standard offset 0x20
+        uintptr_t outerAt20 = 0;
+        Mem::ReadSafe(obj + 0x20, outerAt20);
+
+        // Read candidate Outer at CPN offset 0x28
+        uintptr_t outerAt28 = 0;
+        Mem::ReadSafe(obj + 0x28, outerAt28);
+
+        // A valid Outer is either null (Package-level objects) or a plausible user-space pointer.
+        // Also: Outer must be a UObject, so its Class at +0x10 should be a valid pointer too.
+        auto isValidOuter = [](uintptr_t val) -> bool {
+            if (val == 0) return true; // null = root package
+            if (val < 0x10000 || val > 0x00007FFFFFFFFFFF) return false;
+            uintptr_t outerCls = 0;
+            if (!Mem::ReadSafe(val + Constants::OFF_UOBJECT_CLASS, outerCls)) return false;
+            return outerCls > 0x10000 && outerCls < 0x00007FFFFFFFFFFF;
+        };
+
+        bool at20valid = isValidOuter(outerAt20);
+        bool at28valid = isValidOuter(outerAt28);
+
+        // If +0x20 is valid and +0x28 is NOT a valid UObject pointer → standard
+        // If +0x20 is NOT valid and +0x28 IS valid → CPN
+        // If both valid, check ComparisonIndex vs DisplayIndex
+        if (at20valid && !at28valid) {
+            ++voteStandard;
+        } else if (!at20valid && at28valid) {
+            ++voteCPN;
+        } else if (at20valid && at28valid) {
+            // Ambiguous — check if CompIdx == DispIdx (CPN signature)
+            uint32_t compIdx = 0, dispIdx = 0;
+            Mem::ReadSafe(obj + 0x18, compIdx);
+            Mem::ReadSafe(obj + 0x1C, dispIdx);
+            if (compIdx == dispIdx && compIdx > 0 && compIdx < 0x00FFFFFF) {
+                ++voteCPN;
+            } else {
+                ++voteStandard;
+            }
+        }
+        ++tested;
+    }
+
+    Logger::Info("DYNO", "DetectCasePreservingName: votes standard=%d, CPN=%d (tested %d objects)",
+             voteStandard, voteCPN, tested);
+
+    if (voteCPN > voteStandard) {
+        DynOff::bCasePreservingName = true;
+        DynOff::UOBJECT_OUTER = 0x28;
+        Logger::Info("DYNO", "DetectCasePreservingName: CPN ACTIVE — UObject::Outer = +0x28");
+    } else {
+        DynOff::bCasePreservingName = false;
+        DynOff::UOBJECT_OUTER = 0x20;
+        Logger::Info("DYNO", "DetectCasePreservingName: Standard FName — UObject::Outer = +0x20");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DetectUPropertyMode — Determine if this is a UE4 <4.25 game using UProperty
+// (UObject-derived properties in Children chain) vs FProperty (FField-based).
+//
+// Primary: Use the detected UE version number (>= 425 means FProperty).
+// Fallback (version unknown): Search for actual UProperty *instances* in GObjects.
+//   In UE4 <4.25, property instances (e.g., "Owner" with class "ObjectProperty")
+//   are UObject-derived and registered in GObjects.
+//   In UE4.25+/UE5, property instances are FField-based and NOT in GObjects
+//   (even though the UClass "ObjectProperty" still exists for reflection).
+// ─────────────────────────────────────────────────────────────────────────────
+static void DetectUPropertyMode(uint32_t ueVersion) {
+    Logger::Info("DYNO", "DetectUPropertyMode: Checking for UProperty vs FProperty (UE version=%u)...", ueVersion);
+
+    // Primary: version-based detection (most reliable)
+    if (ueVersion >= 425) {
+        // UE4.25 introduced FProperty/FField; all UE5 versions use it
+        DynOff::bUseFProperty = true;
+        Logger::Info("DYNO", "DetectUPropertyMode: FProperty mode (UE version %u >= 425)", ueVersion);
+        return;
+    }
+
+    if (ueVersion > 0 && ueVersion < 425) {
+        // Confirmed UE4 <4.25 — uses UProperty
+        DynOff::bUseFProperty = false;
+        DynOff::UFIELD_NEXT = DynOff::bCasePreservingName ? 0x30 : 0x28;
+        Logger::Info("DYNO", "DetectUPropertyMode: UProperty mode (UE version %u < 425), UField::Next = +0x%02X",
+                 ueVersion, DynOff::UFIELD_NEXT);
+        return;
+    }
+
+    // Fallback: UE version unknown (0) — heuristic detection via GObjects.
+    // Search for actual property *instances* whose class name ends with "Property".
+    // In UE4 <4.25: objects like "Owner" (class=ObjectProperty) exist in GObjects.
+    // In UE5: only the UClass definition "ObjectProperty" exists (class=Class), not instances.
+    Logger::Info("DYNO", "DetectUPropertyMode: Version unknown — using heuristic GObjects scan");
+
+    bool foundPropertyInstance = false;
+    int32_t count = ObjectArray::GetCount();
+
+    for (int32_t i = 0; i < count && i < 50000; ++i) {
+        uintptr_t obj = ObjectArray::GetByIndex(i);
+        if (!obj) continue;
+
+        // Read this object's class
+        uintptr_t cls = 0;
+        if (!Mem::ReadSafe(obj + Constants::OFF_UOBJECT_CLASS, cls) || !cls) continue;
+
+        // Get the class name
+        uint32_t clsNameIdx = 0;
+        if (!Mem::ReadSafe(cls + Constants::OFF_UOBJECT_NAME, clsNameIdx)) continue;
+        std::string clsName = FNamePool::GetString(clsNameIdx);
+
+        // Skip "Class" — we don't want the UClass definition, we want instances
+        if (clsName == "Class" || clsName == "ScriptStruct" || clsName == "Package" ||
+            clsName == "Function" || clsName == "Enum") continue;
+
+        // Check if class name ends with "Property" (e.g., "ObjectProperty", "IntProperty")
+        if (clsName.size() > 8 && clsName.substr(clsName.size() - 8) == "Property") {
+            // This is a UProperty instance — confirms UE4 <4.25 mode
+            uint32_t objNameIdx = 0;
+            Mem::ReadSafe(obj + Constants::OFF_UOBJECT_NAME, objNameIdx);
+            std::string objName = FNamePool::GetString(objNameIdx);
+            foundPropertyInstance = true;
+            Logger::Info("DYNO", "DetectUPropertyMode: Found UProperty instance '%s' (class=%s) at 0x%llX",
+                     objName.c_str(), clsName.c_str(), (unsigned long long)obj);
+            break;
+        }
+    }
+
+    if (foundPropertyInstance) {
+        DynOff::bUseFProperty = false;
+        DynOff::UFIELD_NEXT = DynOff::bCasePreservingName ? 0x30 : 0x28;
+        Logger::Info("DYNO", "DetectUPropertyMode: UProperty mode (heuristic), UField::Next = +0x%02X",
+                 DynOff::UFIELD_NEXT);
+    } else {
+        DynOff::bUseFProperty = true;
+        Logger::Info("DYNO", "DetectUPropertyMode: FProperty mode (no UProperty instances found in GObjects)");
+    }
+}
+
+bool ValidateAndFixOffsets(uint32_t ueVersion) {
+    Logger::Info("DYNO", "ValidateAndFixOffsets: Starting dynamic offset detection...");
+
+    // Step 1: Detect CasePreservingName by probing UObject layout
+    DetectCasePreservingName();
+
+    // Step 2: Detect UE4 UProperty vs FProperty mode
+    DetectUPropertyMode(ueVersion);
+
+    // Step 2.5: Set version-based defaults BEFORE probing (so if probing fails, we have sane values)
+    // These serve as the fallback if Guid/Vector structs can't be found.
+    if (DynOff::bUseFProperty) {
+        if (ueVersion >= 501 || ueVersion == 0) {
+            // UE5.1.1+ uses FFieldVariant=0x08 (smaller): Next=0x18, Name=0x20, Offset=0x44
+            // Also apply for unknown version since most modern UE5 games are 5.1+
+            // Note: UE5.0 and UE5.1.0 use FFieldVariant=0x10 (larger): Next=0x20, Name=0x28, Offset=0x4C
+            // We default to the more common 5.1.1+ layout; probing will correct if wrong.
+            if (ueVersion >= 502 || (ueVersion == 0)) {
+                // UE5.2+ almost certainly uses the smaller FFieldVariant
+                DynOff::FFIELD_NEXT        = 0x18;
+                DynOff::FFIELD_NAME        = 0x20;
+                DynOff::FPROPERTY_ELEMSIZE = 0x34;
+                DynOff::FPROPERTY_FLAGS    = 0x38;
+                DynOff::FPROPERTY_OFFSET   = 0x44;
+                DynOff::FSTRUCTPROP_STRUCT  = 0x70;
+                DynOff::FBOOLPROP_FIELDSIZE = 0x70;
+                Logger::Info("DYNO", "ValidateAndFixOffsets: Set UE5.1.1+ defaults (FFieldVariant=0x08)");
+                // UE5.3+ uses tagged FFieldVariant: LSB=1 means UObject, LSB=0 means FField
+                if (ueVersion >= 503) {
+                    DynOff::bTaggedFFieldVariant = true;
+                    Logger::Info("DYNO", "ValidateAndFixOffsets: UE5.3+ tagged FFieldVariant enabled");
+                }
+            }
+            // UE5.1 is ambiguous (5.1.0 = larger, 5.1.1+ = smaller), leave as-is for probing
+        }
+    }
+
+    // Step 3: Find "Guid" or "Vector" struct for probing
+    uintptr_t guidStruct = FindStructByName("Guid");
+    uintptr_t vectorStruct = FindStructByName("Vector");
+
+    if (!guidStruct && !vectorStruct) {
+        Logger::Warn("DYNO", "ValidateAndFixOffsets: Cannot find Guid or Vector struct — trying heuristic fallback");
+
+        // ═══════════════════════════════════════════════════════════════════
+        // Heuristic fallback (no Guid/Vector struct to probe against)
+        //
+        // Two-phase approach:
+        //   Phase A: Probe USTRUCT_CHILDPROPS — the default (0x50) may be wrong
+        //            for newer UE versions (e.g. UE 5.7 may have shifted UStruct layout).
+        //            Scans multiple candidate offsets on GObjects classes to find which
+        //            one leads to valid FField chains with resolvable "Property" type names.
+        //   Phase B: Probe FPROPERTY_OFFSET — find Offset_Internal within FProperty
+        //            by checking for strictly increasing sequences bounded by PropertiesSize.
+        // ═══════════════════════════════════════════════════════════════════
+        if (DynOff::bUseFProperty) {
+
+            // ── Phase A: Detect USTRUCT_CHILDPROPS ──────────────────────────
+            // For each candidate offset (0x48 to 0x68, step 8), check if reading
+            // a pointer from GObjects UClass/UStruct objects leads to valid FField
+            // chains whose FFieldClass resolves to a name containing "Property".
+            Logger::Info("DYNO", "Phase A: Probing USTRUCT_CHILDPROPS...");
+
+            int bestChildPropsOff = -1;
+            int bestChildPropsScore = 0;
+
+            for (int cpOff = 0x40; cpOff <= 0x70; cpOff += 8) {
+                int score = 0;
+                int tested = 0;
+                int objLimit = (std::min)(ObjectArray::GetCount(), 80000);
+                for (int32_t i = 0; i < objLimit && tested < 30; ++i) {
+                    uintptr_t obj = ObjectArray::GetByIndex(i);
+                    if (!obj) continue;
+
+                    uintptr_t cp = 0;
+                    if (!Mem::ReadSafe(obj + cpOff, cp) || !cp) continue;
+                    cp = DynOff::StripFFieldTag(cp);
+                    if (cp < 0x10000 || cp > 0x00007FFFFFFFFFFF) continue;
+
+                    // Check FFieldClass* at first FField
+                    uintptr_t fc = 0;
+                    if (!Mem::ReadSafe(cp + DynOff::FFIELD_CLASS, fc) || !fc) continue;
+                    if (fc < 0x10000 || fc > 0x00007FFFFFFFFFFF) continue;
+
+                    // Resolve FFieldClass name — must contain "Property"
+                    uint32_t fcNameIdx = 0;
+                    if (!Mem::ReadSafe(fc + DynOff::FFIELDCLASS_NAME, fcNameIdx)) continue;
+                    std::string fcName = FNamePool::GetString(fcNameIdx);
+                    if (fcName.find("Property") == std::string::npos) continue;
+
+                    // Validate chain has 2+ entries with valid Next pointers
+                    uintptr_t next = 0;
+                    if (!Mem::ReadSafe(cp + DynOff::FFIELD_NEXT, next)) continue;
+                    next = DynOff::StripFFieldTag(next);
+                    if (next && next > 0x10000 && next < 0x00007FFFFFFFFFFF) {
+                        // Second entry also has valid FFieldClass with "Property"?
+                        uintptr_t fc2 = 0;
+                        if (Mem::ReadSafe(next + DynOff::FFIELD_CLASS, fc2) && fc2 > 0x10000) {
+                            uint32_t fc2Idx = 0;
+                            if (Mem::ReadSafe(fc2 + DynOff::FFIELDCLASS_NAME, fc2Idx)) {
+                                std::string fc2Name = FNamePool::GetString(fc2Idx);
+                                if (fc2Name.find("Property") != std::string::npos) {
+                                    score += 2; // Strong match: 2-entry chain with Property types
+                                }
+                            }
+                        }
+                    }
+                    ++score;
+                    ++tested;
+                }
+
+                Logger::Info("DYNO", "  CHILDPROPS probe +0x%02X: score=%d (tested %d objects)", cpOff, score, tested);
+
+                if (score > bestChildPropsScore) {
+                    bestChildPropsScore = score;
+                    bestChildPropsOff = cpOff;
+                }
+            }
+
+            if (bestChildPropsOff >= 0 && bestChildPropsOff != DynOff::USTRUCT_CHILDPROPS) {
+                int oldCP = DynOff::USTRUCT_CHILDPROPS;
+                DynOff::USTRUCT_CHILDPROPS = bestChildPropsOff;
+                // Derive related UStruct offsets (relative positions are stable across UE versions)
+                DynOff::USTRUCT_CHILDREN  = bestChildPropsOff - 0x08;
+                DynOff::USTRUCT_SUPER     = bestChildPropsOff - 0x10;
+                DynOff::USTRUCT_PROPSSIZE = bestChildPropsOff + 0x08;
+                Logger::Info("DYNO", "Phase A: USTRUCT_CHILDPROPS changed 0x%02X -> 0x%02X "
+                    "(score=%d, Super=0x%02X, PropsSize=0x%02X)",
+                    oldCP, bestChildPropsOff, bestChildPropsScore,
+                    DynOff::USTRUCT_SUPER, DynOff::USTRUCT_PROPSSIZE);
+            } else if (bestChildPropsOff >= 0) {
+                Logger::Info("DYNO", "Phase A: USTRUCT_CHILDPROPS confirmed at 0x%02X (score=%d)",
+                    DynOff::USTRUCT_CHILDPROPS, bestChildPropsScore);
+            } else {
+                Logger::Warn("DYNO", "Phase A: No valid CHILDPROPS offset found, keeping default 0x%02X",
+                    DynOff::USTRUCT_CHILDPROPS);
+            }
+
+            // ── Phase B: Detect FPROPERTY_OFFSET ────────────────────────────
+            // Now that USTRUCT_CHILDPROPS is (hopefully) correct, collect FField
+            // chain addresses from multiple classes and probe for Offset_Internal.
+            Logger::Info("DYNO", "Phase B: Probing FPROPERTY_OFFSET...");
+
+            // Helper: infer natural alignment from FFieldClass type name.
+            // Pointers/containers = 8, int/float = 4, short = 2, bool/byte = 1.
+            // Returns 0 for unknown types (no alignment penalty applied).
+            auto GetNaturalAlignment = [](uintptr_t ffieldAddr) -> int {
+                uintptr_t fc = 0;
+                if (!Mem::ReadSafe(ffieldAddr + DynOff::FFIELD_CLASS, fc) || !fc) return 0;
+                if (fc < 0x10000 || fc > 0x00007FFFFFFFFFFF) return 0;
+                uint32_t nameIdx = 0;
+                if (!Mem::ReadSafe(fc + DynOff::FFIELDCLASS_NAME, nameIdx)) return 0;
+                std::string tn = FNamePool::GetString(nameIdx);
+                if (tn.empty()) return 0;
+
+                // 8-byte: all pointer/container/64-bit types
+                if (tn.find("ObjectProperty") != std::string::npos ||
+                    tn.find("ClassProperty")  != std::string::npos ||
+                    tn == "ArrayProperty" || tn == "MapProperty" || tn == "SetProperty" ||
+                    tn == "NameProperty"  || tn == "StrProperty"  || tn == "TextProperty" ||
+                    tn == "Int64Property" || tn == "UInt64Property" || tn == "DoubleProperty" ||
+                    tn == "DelegateProperty" || tn == "MulticastDelegateProperty" ||
+                    tn == "MulticastInlineDelegateProperty" || tn == "MulticastSparseDelegateProperty" ||
+                    tn == "WeakObjectProperty"  || tn == "LazyObjectProperty" ||
+                    tn == "SoftObjectProperty"  || tn == "SoftClassProperty" ||
+                    tn == "InterfaceProperty")
+                    return 8;
+                // 4-byte: int/uint32/float/enum
+                if (tn == "IntProperty" || tn == "UInt32Property" || tn == "FloatProperty" ||
+                    tn == "EnumProperty")
+                    return 4;
+                // 2-byte: short
+                if (tn == "UInt16Property" || tn == "Int16Property")
+                    return 2;
+                // 1-byte: bool/byte
+                if (tn == "BoolProperty" || tn == "ByteProperty" || tn == "Int8Property")
+                    return 1;
+                return 0;
+            };
+
+            struct FallbackCandidate {
+                uintptr_t classAddr;
+                uintptr_t fAddrs[8];
+                int       nFields;
+                int32_t   propsSize;
+            };
+            FallbackCandidate candidates[5] = {};
+            int nCandidates = 0;
+
+            int limit = (std::min)(ObjectArray::GetCount(), 100000);
+            for (int32_t i = 0; i < limit && nCandidates < 5; ++i) {
+                uintptr_t obj = ObjectArray::GetByIndex(i);
+                if (!obj) continue;
+
+                uintptr_t cp = 0;
+                if (!Mem::ReadSafe(obj + DynOff::USTRUCT_CHILDPROPS, cp) || !cp) continue;
+                cp = DynOff::StripFFieldTag(cp);
+                if (cp < 0x10000 || cp > 0x00007FFFFFFFFFFF) continue;
+
+                uintptr_t fc = 0;
+                if (!Mem::ReadSafe(cp + DynOff::FFIELD_CLASS, fc) || !fc) continue;
+                if (fc < 0x10000 || fc > 0x00007FFFFFFFFFFF) continue;
+
+                auto& c = candidates[nCandidates];
+                c.classAddr = obj;
+                c.nFields = 0;
+
+                uintptr_t cur = cp;
+                while (cur && c.nFields < 8) {
+                    c.fAddrs[c.nFields++] = cur;
+                    uintptr_t next = 0;
+                    if (!Mem::ReadSafe(cur + DynOff::FFIELD_NEXT, next)) break;
+                    cur = DynOff::StripFFieldTag(next);
+                }
+                if (c.nFields < 4) continue;
+
+                int32_t ps = 0;
+                Mem::ReadSafe(obj + DynOff::USTRUCT_PROPSSIZE, ps);
+                if (ps <= 0 || ps > 0x100000) continue;
+                c.propsSize = ps;
+
+                uint32_t nameIdx = 0;
+                std::string className;
+                if (Mem::ReadSafe(obj + Constants::OFF_UOBJECT_NAME, nameIdx))
+                    className = FNamePool::GetString(nameIdx);
+                Logger::Info("DYNO", "  Phase B candidate[%d]: '%s' at 0x%llX, fields=%d, propsSize=%d",
+                    nCandidates, className.c_str(), (unsigned long long)obj, c.nFields, ps);
+
+                ++nCandidates;
+            }
+
+            if (nCandidates > 0) {
+                int bestProbe = -1;
+                int bestScore = 0;
+
+                for (int probe = 0x30; probe <= 0x78; probe += 4) {
+                    int totalScore = 0;
+                    int classesValid = 0;
+
+                    for (int ci = 0; ci < nCandidates; ++ci) {
+                        auto& c = candidates[ci];
+                        int score = 0;
+                        int32_t prevOff = -1;
+                        int32_t firstOff = -1;
+                        bool valid = true;
+                        bool hasStrictIncrease = false;
+
+                        for (int i = 0; i < c.nFields && valid; ++i) {
+                            int32_t off = -1;
+                            if (!Mem::ReadSafe(c.fAddrs[i] + probe, off)) { valid = false; break; }
+                            if (off < 0 || off >= c.propsSize)            { valid = false; break; }
+                            if (prevOff >= 0 && off < prevOff)            { valid = false; break; }
+                            if (i == 0) firstOff = off;
+                            if (off > prevOff) hasStrictIncrease = true;
+                            if (off >= prevOff) ++score;
+                            prevOff = off;
+
+                            // Alignment bonus/penalty: reward correctly aligned offsets
+                            int align = GetNaturalAlignment(c.fAddrs[i]);
+                            if (align > 0 && (off % align) == 0)         score += 2;
+                            else if (align >= 4 && (off % align) != 0)   score -= 1;
+                        }
+
+                        // Validation: require strict increase AND first offset >= 0x20
+                        // (real FProperty::Offset_Internal is always >= UObject header size)
+                        if (valid && hasStrictIncrease && firstOff >= 0x20) {
+                            totalScore += score;
+                            ++classesValid;
+                        }
+                    }
+
+                    if (classesValid > 0) {
+                        Logger::Debug("DYNO", "  probe +0x%02X: validClasses=%d, totalScore=%d",
+                            probe, classesValid, totalScore);
+                    }
+
+                    if (classesValid > 0 && totalScore > bestScore) {
+                        bestScore = totalScore;
+                        bestProbe = probe;
+                    }
+                }
+
+                if (bestProbe >= 0 && bestProbe != DynOff::FPROPERTY_OFFSET) {
+                    Logger::Info("DYNO", "Phase B: FPROPERTY_OFFSET changed 0x%02X -> 0x%02X (score=%d)",
+                        DynOff::FPROPERTY_OFFSET, bestProbe, bestScore);
+                    DynOff::FPROPERTY_OFFSET = bestProbe;
+                    DynOff::FPROPERTY_ELEMSIZE = bestProbe - 0x10;
+                    DynOff::FPROPERTY_FLAGS    = bestProbe - 0x0C;
+                    DynOff::FSTRUCTPROP_STRUCT  = bestProbe + 0x2C;
+                    DynOff::FARRAYPROP_INNER   = bestProbe + 0x2C;
+                    DynOff::FBOOLPROP_FIELDSIZE = bestProbe + 0x2C;
+                    DynOff::FENUMPROP_ENUM     = bestProbe + 0x2C;
+                    DynOff::FBYTEPROP_ENUM     = bestProbe + 0x2C;
+                } else if (bestProbe >= 0) {
+                    Logger::Info("DYNO", "Phase B: Confirmed default FPROPERTY_OFFSET=0x%02X", DynOff::FPROPERTY_OFFSET);
+                } else {
+                    Logger::Warn("DYNO", "Phase B: No valid FPROPERTY_OFFSET found — dumping raw probe data");
+                    if (nCandidates > 0) {
+                        auto& c = candidates[0];
+                        for (int probe = 0x30; probe <= 0x78; probe += 4) {
+                            char buf[256];
+                            int pos = snprintf(buf, sizeof(buf), "  raw +0x%02X:", probe);
+                            for (int i = 0; i < c.nFields && i < 6; ++i) {
+                                int32_t val = 0;
+                                Mem::ReadSafe(c.fAddrs[i] + probe, val);
+                                pos += snprintf(buf + pos, sizeof(buf) - pos, " %d", val);
+                            }
+                            Logger::Debug("DYNO", "%s", buf);
+                        }
+                    }
+                }
+            } else {
+                Logger::Warn("DYNO", "Phase B: No class with 4+ fields found for FPROPERTY_OFFSET probing");
+            }
+        }
+
+        // Log final offset state
+        Logger::Info("DYNO", "Heuristic final: USTRUCT_SUPER=0x%02X CHILDPROPS=0x%02X PROPSSIZE=0x%02X "
+            "FFIELD_NEXT=0x%02X FFIELD_NAME=0x%02X FPROPERTY_OFFSET=0x%02X",
+            DynOff::USTRUCT_SUPER, DynOff::USTRUCT_CHILDPROPS, DynOff::USTRUCT_PROPSSIZE,
+            DynOff::FFIELD_NEXT, DynOff::FFIELD_NAME, DynOff::FPROPERTY_OFFSET);
+
+        DynOff::bOffsetsValidated.store(true, std::memory_order_release);
+        return false;
+    }
+
+    uintptr_t testStruct = guidStruct ? guidStruct : vectorStruct;
+    const char* testName = guidStruct ? "Guid" : "Vector";
+
+    // Expected field names for each struct
+    // Guid:   A, B, C, D  (offsets: 0, 4, 8, 12)
+    // Vector: X, Y, Z     (offsets: 0, 4, 8) — but may be float/double
+    const char* expectedFirst  = guidStruct ? "A" : "X";
+    const char* expectedSecond = guidStruct ? "B" : "Y";
+    int expectedElemSize     = 4;
+
+    Logger::Info("DYNO", "ValidateAndFixOffsets: Using struct '%s' at 0x%llX", testName, (unsigned long long)testStruct);
+
+    // Step 4: Find ChildProperties (or Children for UE4 UProperty mode)
+    uintptr_t childProps = 0;
+    int childPropsOff = -1;
+
+    // For UE4 UProperty mode, the chain is in UStruct::Children and items are UObject-derived.
+    // For FProperty mode, the chain is in UStruct::ChildProperties and items are FField-based.
+
+    // Probe offsets 0x38..0x80 in 8-byte steps for a valid chain head pointer
+    for (int off = 0x38; off <= 0x80; off += 8) {
+        uintptr_t ptr = 0;
+        if (!Mem::ReadSafe(testStruct + off, ptr) || !ptr) continue;
+
+        // Basic pointer validity: must be in user space
+        if (ptr < 0x10000 || ptr > 0x00007FFFFFFFFFFF) continue;
+
+        if (DynOff::bUseFProperty) {
+            // FProperty mode: check if this pointer has an FFieldClass* at +0x08
+            uintptr_t fieldClass = 0;
+            if (!Mem::ReadSafe(ptr + 0x08, fieldClass) || !fieldClass) continue;
+            if (fieldClass < 0x10000 || fieldClass > 0x00007FFFFFFFFFFF) continue;
+
+            // The FFieldClass should have an FName that resolves to a *Property type name
+            uint32_t fcNameIdx = 0;
+            if (!Mem::ReadSafe(fieldClass, fcNameIdx)) continue;
+            std::string fcName = FNamePool::GetString(fcNameIdx);
+            if (fcName.find("Property") != std::string::npos) {
+                childProps = ptr;
+                childPropsOff = off;
+                Logger::Info("DYNO", "ValidateAndFixOffsets: ChildProperties found at struct+0x%02X → 0x%llX (FFieldClass='%s')",
+                         off, (unsigned long long)ptr, fcName.c_str());
+                break;
+            }
+        } else {
+            // UProperty mode: items are UObjects. Check if Class at +0x10 resolves to a *Property class.
+            uintptr_t cls = 0;
+            if (!Mem::ReadSafe(ptr + Constants::OFF_UOBJECT_CLASS, cls) || !cls) continue;
+            if (cls < 0x10000 || cls > 0x00007FFFFFFFFFFF) continue;
+
+            uint32_t clsNameIdx = 0;
+            if (!Mem::ReadSafe(cls + Constants::OFF_UOBJECT_NAME, clsNameIdx)) continue;
+            std::string clsName = FNamePool::GetString(clsNameIdx);
+            if (clsName.find("Property") != std::string::npos) {
+                childProps = ptr;
+                childPropsOff = off;
+                Logger::Info("DYNO", "ValidateAndFixOffsets: Children (UProperty) found at struct+0x%02X → 0x%llX (Class='%s')",
+                         off, (unsigned long long)ptr, clsName.c_str());
+                break;
+            }
+        }
+    }
+
+    if (!childProps && DynOff::bUseFProperty) {
+        // FProperty scan failed. This could mean the game is actually UE4 pre-4.25
+        // using UProperty (UObject-derived properties). Common when version is misdetected
+        // (e.g., FF7R detected as UE5.04 but is actually UE4.18).
+        // Retry with UProperty mode: look for UObject-derived properties in the chain.
+        Logger::Warn("DYNO", "ValidateAndFixOffsets: FProperty scan failed on '%s', retrying as UProperty...", testName);
+
+        // Expand probe range to include UE4 offsets (UStruct may start at +0x30)
+        for (int off = 0x28; off <= 0x80; off += 8) {
+            uintptr_t ptr = 0;
+            if (!Mem::ReadSafe(testStruct + off, ptr) || !ptr) continue;
+            if (ptr < 0x10000 || ptr > 0x00007FFFFFFFFFFF) continue;
+
+            // UProperty mode: items are UObjects. Check if Class at +0x10 resolves to a *Property class.
+            uintptr_t cls = 0;
+            if (!Mem::ReadSafe(ptr + Constants::OFF_UOBJECT_CLASS, cls) || !cls) continue;
+            if (cls < 0x10000 || cls > 0x00007FFFFFFFFFFF) continue;
+
+            uint32_t clsNameIdx = 0;
+            if (!Mem::ReadSafe(cls + Constants::OFF_UOBJECT_NAME, clsNameIdx)) continue;
+            std::string clsName = FNamePool::GetString(clsNameIdx);
+            if (clsName.find("Property") != std::string::npos) {
+                childProps = ptr;
+                childPropsOff = off;
+                DynOff::bUseFProperty = false;
+                DynOff::bTaggedFFieldVariant = false;  // UE4 has no tagged FFieldVariant
+                DynOff::UFIELD_NEXT = DynOff::bCasePreservingName ? 0x30 : 0x28;
+                Logger::Info("DYNO", "ValidateAndFixOffsets: FALLBACK — UProperty mode detected. "
+                         "Children at struct+0x%02X → 0x%llX (Class='%s')",
+                         off, (unsigned long long)ptr, clsName.c_str());
+                break;
+            }
+        }
+    }
+
+    if (!childProps) {
+        Logger::Warn("DYNO", "ValidateAndFixOffsets: Cannot find ChildProperties in '%s', keeping defaults", testName);
+        DynOff::bOffsetsValidated.store(true, std::memory_order_release);
+        return false;
+    }
+
+    // Update ChildProperties offset
+    if (DynOff::bUseFProperty) {
+        DynOff::USTRUCT_CHILDPROPS = childPropsOff;
+    } else {
+        // In UE4 UProperty mode, the chain is in Children
+        DynOff::USTRUCT_CHILDREN = childPropsOff;
+    }
+
+    // Step 5: Find Name offset on the first chain item
+    int nameOff = -1;
+
+    if (DynOff::bUseFProperty) {
+        // FProperty: Probe 4-byte aligned offsets from 0x18 to 0x48 on the first FField
+        for (int off = 0x18; off <= 0x48; off += 4) {
+            uint32_t nameIdx = 0;
+            if (!Mem::ReadSafe(childProps + off, nameIdx)) continue;
+            if (nameIdx == 0 || nameIdx > 0x00FFFFFF) continue;
+
+            std::string name = FNamePool::GetString(nameIdx);
+            if (name == expectedFirst || name == expectedSecond) {
+                nameOff = off;
+                Logger::Info("DYNO", "ValidateAndFixOffsets: FField::Name at FField+0x%02X (resolved='%s')",
+                         off, name.c_str());
+                break;
+            }
+        }
+
+        if (nameOff < 0) {
+            Logger::Warn("DYNO", "ValidateAndFixOffsets: Cannot find FField::Name, keeping default 0x%02X",
+                     DynOff::FFIELD_NAME);
+        } else {
+            DynOff::FFIELD_NAME = nameOff;
+        }
+    } else {
+        // UProperty (UObject-derived): Name is at UObject::Name = 0x18 (always stable)
+        nameOff = Constants::OFF_UOBJECT_NAME;
+        Logger::Info("DYNO", "ValidateAndFixOffsets: UProperty::Name at UObject+0x%02X (standard)", nameOff);
+    }
+
+    // Step 6: Find Next offset on the chain
+    int nextOff = -1;
+
+    if (DynOff::bUseFProperty) {
+        // FField::Next: Probe 8-byte aligned offsets 0x10..0x38
+        for (int off = 0x10; off <= 0x38; off += 8) {
+            if (off == DynOff::FFIELD_CLASS) continue; // Skip the Class pointer
+
+            uintptr_t nextPtr = 0;
+            if (!Mem::ReadSafe(childProps + off, nextPtr) || !nextPtr) continue;
+
+            // UE5.3+: offset 0x10 is FFieldVariant Owner (tagged pointer).
+            // If LSB is set, this is a UObject owner reference — skip it as Next candidate.
+            if (DynOff::IsFFieldVariantUObject(nextPtr)) continue;
+            nextPtr = DynOff::StripFFieldTag(nextPtr);
+
+            if (nextPtr < 0x10000 || nextPtr > 0x00007FFFFFFFFFFF) continue;
+
+            // Verify it looks like an FField: check FFieldClass at +0x08
+            uintptr_t nextFieldClass = 0;
+            if (!Mem::ReadSafe(nextPtr + DynOff::FFIELD_CLASS, nextFieldClass) || !nextFieldClass) continue;
+
+            uint32_t fcNameIdx2 = 0;
+            if (!Mem::ReadSafe(nextFieldClass, fcNameIdx2)) continue;
+            std::string fcName2 = FNamePool::GetString(fcNameIdx2);
+            if (fcName2.find("Property") == std::string::npos) continue;
+
+            // Double-check: read FName at the detected Name offset on the next field
+            if (nameOff >= 0) {
+                uint32_t nextNameIdx = 0;
+                if (Mem::ReadSafe(nextPtr + nameOff, nextNameIdx) && nextNameIdx > 0) {
+                    std::string nextName = FNamePool::GetString(nextNameIdx);
+                    if (!nextName.empty() && nextName.length() <= 64) {
+                        nextOff = off;
+                        Logger::Info("DYNO", "ValidateAndFixOffsets: FField::Next at FField+0x%02X (next='%s')",
+                                 off, nextName.c_str());
+                        break;
+                    }
+                }
+            } else {
+                nextOff = off;
+                Logger::Info("DYNO", "ValidateAndFixOffsets: FField::Next at FField+0x%02X (unverified name)", off);
+                break;
+            }
+        }
+
+        if (nextOff < 0) {
+            Logger::Warn("DYNO", "ValidateAndFixOffsets: Cannot find FField::Next, keeping default 0x%02X",
+                     DynOff::FFIELD_NEXT);
+        } else {
+            DynOff::FFIELD_NEXT = nextOff;
+        }
+
+        // Step 6.5: Infer FFieldVariant size from detected Next offset.
+        // If UE5.1.1+ defaults were set (Next=0x18) but probing found Next=0x20,
+        // the game uses FFieldVariant=0x10 (UE5.0-5.1.0 layout) despite its version number.
+        // Common in Square Enix forks (DQ HD-2D series reports UE505 but uses UE5.0 FField layout).
+        // Fix: set Name = Next + 8, disable tagged FFieldVariant.
+        // FProperty offsets will be re-probed correctly in Step 8 with fixed field names.
+        if (nextOff == 0x20 && nameOff < 0) {
+            DynOff::FFIELD_NAME = 0x28;  // FName follows Next in FField layout
+            nameOff = 0x28;
+            Logger::Info("DYNO", "ValidateAndFixOffsets: Inferred FField::Name=0x28 from Next=0x20 (FFieldVariant=0x10)");
+
+            if (DynOff::bTaggedFFieldVariant) {
+                DynOff::bTaggedFFieldVariant = false;
+                Logger::Info("DYNO", "ValidateAndFixOffsets: Disabled tagged FFieldVariant (FFieldVariant=0x10 layout)");
+            }
+        }
+    } else {
+        // UProperty (UObject-derived): Probe for UField::Next
+        // Standard UE4: Next at +0x28 (or +0x30 for CPN), but some games have extra
+        // UObject/UField members that push Next further (e.g., DQ XI S has Next at +0x38).
+        // Probe candidate offsets and validate by checking the next item is a *Property UObject.
+        int defaultNext = DynOff::UFIELD_NEXT;  // 0x28 or 0x30
+
+        for (int off = 0x20; off <= 0x48; off += 8) {
+            uintptr_t nextPtr = 0;
+            if (!Mem::ReadSafe(childProps + off, nextPtr) || !nextPtr) continue;
+            if (nextPtr < 0x10000 || nextPtr > 0x00007FFFFFFFFFFF) continue;
+
+            // Verify: target must be a UObject whose Class name contains "Property"
+            uintptr_t nextCls = 0;
+            if (!Mem::ReadSafe(nextPtr + Constants::OFF_UOBJECT_CLASS, nextCls) || !nextCls) continue;
+            if (nextCls < 0x10000 || nextCls > 0x00007FFFFFFFFFFF) continue;
+
+            uint32_t nextClsNameIdx = 0;
+            if (!Mem::ReadSafe(nextCls + Constants::OFF_UOBJECT_NAME, nextClsNameIdx)) continue;
+            std::string nextClsName = FNamePool::GetString(nextClsNameIdx);
+            if (nextClsName.find("Property") == std::string::npos) continue;
+
+            // Double-check: read the FName on the next field — must be a valid short name
+            uint32_t nextNameIdx = 0;
+            if (Mem::ReadSafe(nextPtr + nameOff, nextNameIdx) && nextNameIdx > 0) {
+                std::string nextName = FNamePool::GetString(nextNameIdx);
+                if (!nextName.empty() && nextName.length() <= 64) {
+                    nextOff = off;
+                    Logger::Info("DYNO", "ValidateAndFixOffsets: UField::Next at UObject+0x%02X "
+                             "(probed, next='%s', class='%s')", off, nextName.c_str(), nextClsName.c_str());
+                    break;
+                }
+            }
+        }
+
+        if (nextOff < 0) {
+            // Fallback: use the default (may fail downstream but at least log it)
+            nextOff = defaultNext;
+            Logger::Warn("DYNO", "ValidateAndFixOffsets: UField::Next probe failed, falling back to +0x%02X", nextOff);
+        }
+
+        // Update the global offset if probing found a non-default value
+        if (nextOff != DynOff::UFIELD_NEXT) {
+            DynOff::UFIELD_NEXT = nextOff;
+            Logger::Info("DYNO", "ValidateAndFixOffsets: Updated UFIELD_NEXT to +0x%02X (was +0x%02X)",
+                     nextOff, defaultNext);
+        }
+    }
+
+    // Step 7: Collect fields from the chain for offset probing
+    struct { uintptr_t addr; std::string name; int expectedOffset; } fields[4] = {};
+    int fieldCount = 0;
+
+    uintptr_t curField = childProps;
+    for (int i = 0; i < 4 && curField && fieldCount < 4; ++i) {
+        fields[fieldCount].addr = curField;
+        if (nameOff >= 0) {
+            uint32_t ni = 0;
+            Mem::ReadSafe(curField + nameOff, ni);
+            fields[fieldCount].name = FNamePool::GetString(ni);
+        }
+
+        const auto& fn = fields[fieldCount].name;
+        if (fn == "A" || fn == "X") fields[fieldCount].expectedOffset = 0;
+        else if (fn == "B" || fn == "Y") fields[fieldCount].expectedOffset = 4;
+        else if (fn == "C" || fn == "Z") fields[fieldCount].expectedOffset = 8;
+        else if (fn == "D") fields[fieldCount].expectedOffset = 12;
+        else fields[fieldCount].expectedOffset = -1;
+
+        ++fieldCount;
+
+        if (nextOff >= 0) {
+            uintptr_t next = 0;
+            Mem::ReadSafe(curField + nextOff, next);
+            curField = next;
+        } else {
+            break;
+        }
+    }
+
+    Logger::Info("DYNO", "ValidateAndFixOffsets: Collected %d fields from '%s' chain", fieldCount, testName);
+    for (int i = 0; i < fieldCount; ++i) {
+        Logger::Debug("DYNO", "  Field[%d]: '%s' at 0x%llX, expectedOff=%d",
+                  i, fields[i].name.c_str(), (unsigned long long)fields[i].addr, fields[i].expectedOffset);
+    }
+
+    // Step 8: Probe for Offset_Internal: scan 4-byte aligned offsets
+    // Range depends on mode: FProperty starts after FField header (~0x30-0x68),
+    // UProperty starts after UField header (~0x28-0x70).
+    // UProperty range extended to 0x70 for games with expanded UObject/UField
+    // (e.g., DQ XI S has +0x10 extra bytes, shifting all UProperty fields).
+    int probeStart = DynOff::bUseFProperty ? 0x30 : 0x28;
+    int probeEnd   = DynOff::bUseFProperty ? 0x68 : 0x70;
+    int propOffsetOff = -1;
+    int propElemSizeOff = -1;
+
+    for (int probe = probeStart; probe <= probeEnd; probe += 4) {
+        int matches = 0;
+        int sizeMatches = 0;
+
+        for (int i = 0; i < fieldCount; ++i) {
+            if (fields[i].expectedOffset < 0) continue;
+
+            int32_t val = -1;
+            if (Mem::ReadSafe(fields[i].addr + probe, val) && val == fields[i].expectedOffset) {
+                ++matches;
+            }
+
+            int32_t sz = -1;
+            if (Mem::ReadSafe(fields[i].addr + probe, sz) && sz == expectedElemSize) {
+                ++sizeMatches;
+            }
+        }
+
+        if (matches >= 2 && propOffsetOff < 0) {
+            propOffsetOff = probe;
+            Logger::Info("DYNO", "ValidateAndFixOffsets: Offset_Internal at +0x%02X (%d matches)", probe, matches);
+        }
+
+        if (sizeMatches >= 2 && propElemSizeOff < 0 && probe != propOffsetOff) {
+            propElemSizeOff = probe;
+            Logger::Info("DYNO", "ValidateAndFixOffsets: ElementSize at +0x%02X (%d matches)", probe, sizeMatches);
+        }
+    }
+
+    if (propOffsetOff >= 0) {
+        if (DynOff::bUseFProperty) {
+            DynOff::FPROPERTY_OFFSET = propOffsetOff;
+        } else {
+            DynOff::UPROPERTY_OFFSET = propOffsetOff;
+        }
+    } else {
+        Logger::Warn("DYNO", "ValidateAndFixOffsets: Cannot find Offset_Internal, keeping defaults");
+    }
+
+    if (propElemSizeOff < 0 && propOffsetOff > 0) {
+        // Heuristic: ElementSize is usually 0x14 bytes before Offset_Internal
+        int guess = propOffsetOff - 0x14;
+        if (guess >= probeStart) {
+            int32_t val = 0;
+            if (Mem::ReadSafe(childProps + guess, val) && val == expectedElemSize) {
+                propElemSizeOff = guess;
+                Logger::Info("DYNO", "ValidateAndFixOffsets: ElementSize (heuristic) at +0x%02X", guess);
+            }
+        }
+    }
+
+    if (propElemSizeOff >= 0) {
+        if (DynOff::bUseFProperty) {
+            DynOff::FPROPERTY_ELEMSIZE = propElemSizeOff;
+        } else {
+            DynOff::UPROPERTY_ELEMSIZE = propElemSizeOff;
+        }
+    }
+
+    // Step 9: Derive remaining offsets
+    // PropertyFlags: ElementSize + 8 (ArrayDim int32 fills the gap)
+    if (DynOff::bUseFProperty) {
+        if (propElemSizeOff >= 0) {
+            DynOff::FPROPERTY_FLAGS = propElemSizeOff + 8;
+        }
+    } else {
+        if (propElemSizeOff >= 0) {
+            DynOff::UPROPERTY_FLAGS = propElemSizeOff + 8;
+        }
+    }
+
+    // UStruct offsets derived from ChildProperties position
+    if (DynOff::bUseFProperty) {
+        DynOff::USTRUCT_PROPSSIZE = childPropsOff + 8;
+        DynOff::USTRUCT_CHILDREN  = childPropsOff - 8;
+        DynOff::USTRUCT_SUPER     = childPropsOff - 0x10;
+    } else {
+        // UE4 UProperty mode: Children is the chain itself
+        DynOff::USTRUCT_SUPER     = childPropsOff - 8;
+        DynOff::USTRUCT_PROPSSIZE = childPropsOff + 8;
+    }
+
+    Logger::Info("DYNO", "ValidateAndFixOffsets: UStruct::SuperStruct at +0x%02X", DynOff::USTRUCT_SUPER);
+
+    // FStructProperty::Struct = Offset_Internal + 0x2C
+    if (DynOff::bUseFProperty && propOffsetOff >= 0) {
+        DynOff::FSTRUCTPROP_STRUCT  = propOffsetOff + 0x2C;
+        DynOff::FARRAYPROP_INNER   = propOffsetOff + 0x2C;  // Same subclass extension offset
+        DynOff::FBOOLPROP_FIELDSIZE = DynOff::FSTRUCTPROP_STRUCT;
+        // FEnumProperty::Enum and FByteProperty::Enum share the same subclass extension offset
+        DynOff::FENUMPROP_ENUM     = DynOff::FSTRUCTPROP_STRUCT;
+        DynOff::FBYTEPROP_ENUM     = DynOff::FSTRUCTPROP_STRUCT;
+    }
+
+    // Infer tagged FFieldVariant from probed offsets:
+    // FFieldVariant=0x08 (Next at 0x18) implies UE5.1.1+ layout.
+    // UE5.3+ uses the tag-bit encoding. If version is unknown but layout matches,
+    // enable tag-bit masking defensively — the StripFFieldTag is a no-op when bit is 0.
+    if (DynOff::bUseFProperty && DynOff::FFIELD_NEXT == 0x18 && !DynOff::bTaggedFFieldVariant) {
+        DynOff::bTaggedFFieldVariant = true;
+        Logger::Info("DYNO", "ValidateAndFixOffsets: Inferred tagged FFieldVariant from FField::Next=0x18");
+    }
+
+    DynOff::bOffsetsValidated.store(true, std::memory_order_release);
+
+    // Summary log
+    Logger::Info("DYNO", "=== Dynamic Offset Summary ===");
+    Logger::Info("DYNO", "  CasePreservingName: %s", DynOff::bCasePreservingName ? "YES" : "no");
+    Logger::Info("DYNO", "  TaggedFFieldVariant:%s", DynOff::bTaggedFFieldVariant ? " YES (UE5.3+)" : " no");
+    Logger::Info("DYNO", "  UseFProperty:       %s", DynOff::bUseFProperty ? "yes (UE4.25+/UE5)" : "NO (UE4 UProperty)");
+    Logger::Info("DYNO", "  UObject::Outer      = +0x%02X", DynOff::UOBJECT_OUTER);
+    Logger::Info("DYNO", "  UStruct::Super      = +0x%02X", DynOff::USTRUCT_SUPER);
+    Logger::Info("DYNO", "  UStruct::Children   = +0x%02X", DynOff::USTRUCT_CHILDREN);
+    Logger::Info("DYNO", "  UStruct::ChildProps = +0x%02X", DynOff::USTRUCT_CHILDPROPS);
+    Logger::Info("DYNO", "  UStruct::PropsSize  = +0x%02X", DynOff::USTRUCT_PROPSSIZE);
+    if (DynOff::bUseFProperty) {
+        Logger::Info("DYNO", "  FField::Class       = +0x%02X", DynOff::FFIELD_CLASS);
+        Logger::Info("DYNO", "  FField::Next        = +0x%02X", DynOff::FFIELD_NEXT);
+        Logger::Info("DYNO", "  FField::Name        = +0x%02X", DynOff::FFIELD_NAME);
+        Logger::Info("DYNO", "  FProperty::ElemSize = +0x%02X", DynOff::FPROPERTY_ELEMSIZE);
+        Logger::Info("DYNO", "  FProperty::Flags    = +0x%02X", DynOff::FPROPERTY_FLAGS);
+        Logger::Info("DYNO", "  FProperty::Offset   = +0x%02X", DynOff::FPROPERTY_OFFSET);
+        Logger::Info("DYNO", "  FStructProp::Struct = +0x%02X", DynOff::FSTRUCTPROP_STRUCT);
+    } else {
+        Logger::Info("DYNO", "  UField::Next        = +0x%02X", DynOff::UFIELD_NEXT);
+        Logger::Info("DYNO", "  UProperty::ElemSize = +0x%02X", DynOff::UPROPERTY_ELEMSIZE);
+        Logger::Info("DYNO", "  UProperty::Flags    = +0x%02X", DynOff::UPROPERTY_FLAGS);
+        Logger::Info("DYNO", "  UProperty::Offset   = +0x%02X", DynOff::UPROPERTY_OFFSET);
+    }
+    Logger::Info("DYNO", "==============================");
+
+    return true;
+}
+
+// ============================================================
+// ExtraScanGObjects — Dumper-7-style .data heuristic
+//
+// Scan the .data section directly at 4-byte granularity and validate
+// each location as a potential FUObjectArray base.  This complements
+// FindGObjectsByDataScan (which follows code RIP-relative refs) by
+// probing addresses that may not be referenced by any code instruction.
+//
+// Two modes per candidate address:
+//   1. Inline:  the FUObjectArray struct lives at &addr itself
+//   2. Pointer: addr holds a pointer to the FUObjectArray struct on the heap
+//
+// Thread-safe: reads game memory only, no global state mutation.
+// ============================================================
+uintptr_t ExtraScanGObjects() {
+    Logger::Info("SCAN:GObj", "ExtraScanGObjects: Starting .data heuristic scan...");
+
+    uintptr_t base = Mem::GetModuleBase(nullptr);
+    if (!base) return 0;
+
+    auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + static_cast<DWORD>(dos->e_lfanew));
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+
+    // Collect ALL writable, non-exec sections (.data, .bss, etc.)
+    struct SectionRange { uintptr_t start; uintptr_t end; };
+    std::vector<SectionRange> dataSections;
+
+    const IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+        if (!section->Misc.VirtualSize || !section->VirtualAddress) continue;
+        bool writable = (section->Characteristics & IMAGE_SCN_MEM_WRITE) != 0;
+        bool exec     = (section->Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
+        if (writable && !exec) {
+            dataSections.push_back({ base + section->VirtualAddress,
+                                     base + section->VirtualAddress + section->Misc.VirtualSize });
+        }
+    }
+
+    if (dataSections.empty()) {
+        Logger::Warn("SCAN:GObj", "ExtraScanGObjects: No writable sections found");
+        return 0;
+    }
+
+    int candidatesTested = 0;
+    g_validationDbgCount = 0;  // Reset throttle for validators
+
+    for (auto& sec : dataSections) {
+        Logger::Debug("SCAN:GObj", "ExtraScanGObjects: Scanning [0x%llX-0x%llX] (%zu bytes)",
+                  (unsigned long long)sec.start, (unsigned long long)sec.end,
+                  (size_t)(sec.end - sec.start));
+
+        for (uintptr_t addr = sec.start; addr + 0x20 < sec.end; addr += 4) {
+            // Mode 1: Inline — the FUObjectArray struct starts at addr
+            if (ValidateGObjects(addr)) {
+                Logger::Info("SCAN:GObj", "ExtraScanGObjects: Found inline FUObjectArray at 0x%llX (%d candidates tested)",
+                         (unsigned long long)addr, candidatesTested);
+                return addr;
+            }
+
+            // Mode 2: Pointer — addr holds a pointer to FUObjectArray
+            uintptr_t ptrVal = 0;
+            if (Mem::ReadSafe(addr, ptrVal) && ptrVal && LooksLikeDataPtr(ptrVal)) {
+                if (ValidateGObjects(ptrVal)) {
+                    Logger::Info("SCAN:GObj", "ExtraScanGObjects: Found pointed FUObjectArray at 0x%llX (ptr@0x%llX, %d candidates tested)",
+                             (unsigned long long)ptrVal, (unsigned long long)addr, candidatesTested);
+                    return ptrVal;
+                }
+            }
+
+            candidatesTested++;
+            // Suppress excessive debug logging after first 50 failures
+            if (candidatesTested == 50)
+                g_validationDbgCount = kMaxValidationDbgLogs;
+        }
+    }
+
+    Logger::Warn("SCAN:GObj", "ExtraScanGObjects: No valid FUObjectArray found (%d candidates tested)", candidatesTested);
+    return 0;
+}
+
+// ============================================================
+// ExtraScanGWorld — Dumper-7-style instance scan
+//
+// 1. Iterate GObjects to find a UWorld instance (by class name)
+// 2. Scan .data sections for a static pointer holding that instance address
+//
+// Requires ObjectArray + FNamePool to be initialized.
+// Thread-safe: reads game memory and existing ObjectArray/FNamePool statics
+// (immutable after init), no global state mutation.
+// ============================================================
+uintptr_t ExtraScanGWorld() {
+    Logger::Info("SCAN:GWld", "ExtraScanGWorld: Starting instance scan...");
+
+    // Step 1: Find a UWorld instance in GObjects
+    int32_t count = ObjectArray::GetCount();
+    if (count <= 0) {
+        Logger::Warn("SCAN:GWld", "ExtraScanGWorld: ObjectArray not initialized (count=%d)", count);
+        return 0;
+    }
+
+    uintptr_t worldInstance = 0;
+    for (int32_t i = 0; i < count; ++i) {
+        uintptr_t obj = ObjectArray::GetByIndex(i);
+        if (!obj) continue;
+
+        // Read class pointer
+        uintptr_t cls = 0;
+        if (!Mem::ReadSafe(obj + Constants::OFF_UOBJECT_CLASS, cls) || !cls) continue;
+
+        // Read class name
+        uint32_t clsNameIdx = 0;
+        if (!Mem::ReadSafe(cls + Constants::OFF_UOBJECT_NAME, clsNameIdx)) continue;
+        std::string clsName = FNamePool::GetString(clsNameIdx);
+        if (clsName != "World") continue;
+
+        // Read object name — skip CDOs
+        uint32_t nameIdx = 0;
+        if (!Mem::ReadSafe(obj + Constants::OFF_UOBJECT_NAME, nameIdx)) continue;
+        std::string name = FNamePool::GetString(nameIdx);
+        if (name.empty() || name.find("Default__") != std::string::npos) continue;
+
+        worldInstance = obj;
+        Logger::Info("SCAN:GWld", "ExtraScanGWorld: Found UWorld instance '%s' at 0x%llX (index=%d)",
+                 name.c_str(), (unsigned long long)obj, i);
+        break;
+    }
+
+    if (!worldInstance) {
+        Logger::Warn("SCAN:GWld", "ExtraScanGWorld: No UWorld instance found in GObjects (scanned %d objects)", count);
+        return 0;
+    }
+
+    // Step 2: Scan .data sections for a pointer to this instance
+    uintptr_t base = Mem::GetModuleBase(nullptr);
+    if (!base) return 0;
+
+    auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + static_cast<DWORD>(dos->e_lfanew));
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+
+    const IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+        if (!section->Misc.VirtualSize || !section->VirtualAddress) continue;
+        bool writable = (section->Characteristics & IMAGE_SCN_MEM_WRITE) != 0;
+        bool exec     = (section->Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
+        if (!writable || exec) continue;
+
+        uintptr_t secBase = base + section->VirtualAddress;
+        size_t    secSize = section->Misc.VirtualSize;
+
+        Logger::Debug("SCAN:GWld", "ExtraScanGWorld: Scanning section [0x%llX-0x%llX] for ptr=0x%llX",
+                  (unsigned long long)secBase, (unsigned long long)(secBase + secSize),
+                  (unsigned long long)worldInstance);
+
+        for (size_t off = 0; off + sizeof(uintptr_t) <= secSize; off += sizeof(uintptr_t)) {
+            uintptr_t val = 0;
+            if (!Mem::ReadSafe(secBase + off, val)) continue;
+            if (val == worldInstance) {
+                uintptr_t gworldAddr = secBase + off;
+                Logger::Info("SCAN:GWld", "ExtraScanGWorld: Found GWorld at 0x%llX (contains 0x%llX)",
+                         (unsigned long long)gworldAddr, (unsigned long long)worldInstance);
+                return gworldAddr;
+            }
+        }
+    }
+
+    Logger::Warn("SCAN:GWld", "ExtraScanGWorld: No static pointer to UWorld instance found in .data sections");
+    return 0;
+}
+
+bool FindAll(EnginePointers& out, ScanProgressFn progress) {
+    LOG_INFO("FindAll: Starting global pointer scan...");
+
+    // Compute PE hash early — needed for hint cache lookup
+    ComputePEHash(out.peHash, sizeof(out.peHash));
+    LOG_INFO("FindAll: PE hash = %s", out.peHash);
+
+    // Load hint cache: previously-winning pattern IDs for this game version
+    auto hints = HintCache::LoadHints(out.peHash);
+
+    // UE version detection — use cached version only when it was reliably detected.
+    // DetectVersion() can take 5+ seconds on large games that lack standard UE version strings.
+    // The version is NOT used during AOB scanning (completely version-agnostic), only post-scan
+    // for DynOff offset selection. Structural findings (UE4 TNameEntryArray, hash-prefixed headers)
+    // will override the version later anyway, so a cached value is safe.
+    // NOTE: Only skip DetectVersion when versionDetected==true (PE resource matched).
+    // When versionDetected==false (inferred/fallback), re-run to avoid amplifying misdetections.
+    if (progress) progress(1, "Detecting UE version...");
+    if (hints.hasVersionHint && hints.ueVersion != 0 && hints.versionDetected) {
+        out.UEVersion = hints.ueVersion;
+        out.bVersionDetected = true;
+        LOG_INFO("FindAll: UE Version = %u (cached, detected) — skipped DetectVersion",
+                 out.UEVersion);
+    } else {
+        out.UEVersion = DetectVersion();
+        out.bVersionDetected = (out.UEVersion != 0);
+        if (out.UEVersion == 0) {
+            out.UEVersion = 504;  // Default fallback when detection fails
+            LOG_WARN("FindAll: UE version detection failed — using default %u", out.UEVersion);
+        }
+        LOG_INFO("FindAll: UE Version = %u (detected=%s)", out.UEVersion,
+                 out.bVersionDetected ? "yes" : "no");
+    }
+
+    if (progress) progress(2, "Scanning GObjects...");
+    out.GObjects = FindGObjects(hints.gobjectsPatternId.empty() ? nullptr
+                                : hints.gobjectsPatternId.c_str());
+    if (!out.GObjects) {
+        LOG_WARN("FindAll: Failed to find GObjects (will continue — Extra Scan may recover)");
+    }
+
+    if (progress) progress(3, "Scanning GNames...");
+    out.GNames = FindGNames(hints.gnamesPatternId.empty() ? nullptr
+                            : hints.gnamesPatternId.c_str());
+    if (!out.GNames) {
+        LOG_WARN("FindAll: Failed to find GNames (will continue — Extra Scan may recover)");
+    }
+
+    // Propagate UE4 TNameEntryArray detection state
+    out.bUE4NameArray = g_isUE4NameArray;
+    out.ue4StringOffset = g_ue4NameStringOffset;
+    out.fnameEntryHeaderOffset = g_fnameEntryHeaderOffset;
+
+    // Propagate scan method info (how each pointer was found)
+    out.gobjectsMethod = s_gobjectsMethod;
+    out.gnamesMethod   = s_gnamesMethod;
+
+    // --- Version inference from detection flags ---
+    // Only apply if GNames was actually found (these flags are set during GNames scan)
+    if (out.GNames) {
+        if (out.bUE4NameArray && out.UEVersion >= 500) {
+            LOG_WARN("FindAll: UE4 TNameEntryArray detected but version=%u (>= 500). "
+                     "Overriding to 422 (UE4 pre-4.23)", out.UEVersion);
+            out.UEVersion = 422;
+        } else if (out.fnameEntryHeaderOffset == 4 && out.UEVersion >= 500) {
+            LOG_WARN("FindAll: Hash-prefixed FNameEntry (hdrOff=4) suggests UE4.26 fork, "
+                     "but version=%u. Overriding to 426", out.UEVersion);
+            out.UEVersion = 426;
+        }
+    }
+
+    if (progress) progress(4, "Scanning GWorld...");
+    out.GWorld = FindGWorld(hints.gworldPatternId.empty() ? nullptr
+                            : hints.gworldPatternId.c_str());
+    out.gworldMethod = s_gworldMethod;
+    // GWorld is non-critical, just log
+
+    // --- AOB Usage Tracking: propagate scan stats ---
+    out.gobjectsPatternId = s_gobjectsReport.winningId;
+    out.gnamesPatternId   = s_gnamesReport.winningId;
+    out.gworldPatternId   = s_gworldReport.winningId;
+    out.gobjectsScanAddr  = s_gobjectsReport.scanAddr;
+    out.gnamesScanAddr    = s_gnamesReport.scanAddr;
+    out.gworldScanAddr    = s_gworldReport.scanAddr;
+
+    ExtractScanStats(s_gobjectsReport, out.gobjectsPatternsTried, out.gobjectsPatternsHit);
+    ExtractScanStats(s_gnamesReport,   out.gnamesPatternsTried,   out.gnamesPatternsHit);
+    ExtractScanStats(s_gworldReport,   out.gworldPatternsTried,   out.gworldPatternsHit);
+
+    // GWorld winning pattern AOB metadata (for CE symbol registration via CreateSymbolScript)
+    if (auto* ws = s_gworldReport.winningSig) {
+        out.gworldAob    = ws->pattern;
+        out.gworldAobPos = ws->instrOffset + ws->opcodeLen;
+        out.gworldAobLen = ws->instrOffset + ws->totalLen;
+    }
+
+    LOG_INFO("FindAll: Complete — GObjects=0x%llX (%s), GNames=0x%llX (%s), GWorld=0x%llX (%s), UE=%u, UE4Names=%s, hdrOff=%d",
+             static_cast<unsigned long long>(out.GObjects), out.gobjectsMethod,
+             static_cast<unsigned long long>(out.GNames), out.gnamesMethod,
+             static_cast<unsigned long long>(out.GWorld), out.gworldMethod,
+             out.UEVersion,
+             out.bUE4NameArray ? "yes" : "no",
+             out.fnameEntryHeaderOffset);
+
+    // Save scan results to hint cache for future acceleration
+    {
+        wchar_t exePathW[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exePathW, MAX_PATH);
+        // Extract just the filename
+        const wchar_t* slash = wcsrchr(exePathW, L'\\');
+        const wchar_t* nameW = slash ? slash + 1 : exePathW;
+        // Convert to UTF-8
+        int sz = WideCharToMultiByte(CP_UTF8, 0, nameW, -1, nullptr, 0, nullptr, nullptr);
+        std::string processName(sz > 0 ? sz - 1 : 0, '\0');
+        if (sz > 0)
+            WideCharToMultiByte(CP_UTF8, 0, nameW, -1, processName.data(), sz, nullptr, nullptr);
+        HintCache::SaveResults(out.peHash, out, processName.c_str());
+    }
+
+    return true;
+}
+
+// ============================================================
+// DetectUEnumNames — Lazy-detect UEnum::Names TArray offset
+//
+// Strategy: Find a well-known UEnum object (ENetRole or EObjectFlags)
+// in GObjects, then probe offsets 0x30..0x120 for a TArray header
+// whose entries resolve to known enum value names.
+// ============================================================
+
+// Read the FName ComparisonIndex at addr and resolve to string (local helper)
+static std::string ReadFNameStr(uintptr_t addr) {
+    int32_t idx = 0;
+    if (!Mem::ReadSafe(addr, idx)) return "";
+    return FNamePool::GetString(idx);
+}
+
+// Read UObject::ClassPrivate name (compact helper, avoids UStructWalker dep)
+static std::string GetObjectClassName(uintptr_t obj) {
+    if (!obj) return "";
+    uintptr_t cls = 0;
+    Mem::ReadSafe(obj + Constants::OFF_UOBJECT_CLASS, cls);
+    if (!cls) return "";
+    return ReadFNameStr(cls + Constants::OFF_UOBJECT_NAME);
+}
+
+// Read UObject::NamePrivate as string
+static std::string GetObjectName(uintptr_t obj) {
+    if (!obj) return "";
+    return ReadFNameStr(obj + Constants::OFF_UOBJECT_NAME);
+}
+
+bool DetectUEnumNames() {
+    // Already detected?
+    if (DynOff::bUEnumNamesDetected.load(std::memory_order_acquire))
+        return true;
+
+    Logger::Info("DYNO:Enum", "DetectUEnumNames: Searching for known enums in GObjects...");
+
+    // Candidate enum names to search for, with expected value count ranges
+    // and a verification substring that should appear in the first few entry names.
+    struct EnumCandidate {
+        const char* name;           // UEnum object name
+        int         minCount;       // Expected min TArray count
+        int         maxCount;       // Expected max TArray count
+        const char* verifySubstr;   // Substring to find in entry FNames
+    };
+    static const EnumCandidate candidates[] = {
+        { "ENetRole",       4, 10, "ROLE_" },
+        { "EObjectFlags",   5, 50, "RF_" },
+        { "EPropertyFlags", 5, 80, "CPF_" },
+    };
+
+    // Search GObjects for each candidate
+    for (const auto& cand : candidates) {
+        uintptr_t enumAddr = 0;
+
+        ObjectArray::ForEach([&](int32_t /*idx*/, uintptr_t obj) -> bool {
+            std::string clsName = GetObjectClassName(obj);
+            if (clsName != "Enum" && clsName != "UserDefinedEnum")
+                return true; // continue
+
+            std::string objName = GetObjectName(obj);
+            if (objName == cand.name) {
+                enumAddr = obj;
+                return false; // stop
+            }
+            return true; // continue
+        });
+
+        if (!enumAddr) {
+            Logger::Debug("DYNO:Enum", "  '%s' not found in GObjects", cand.name);
+            continue;
+        }
+
+        Logger::Info("DYNO:Enum", "  Found '%s' at 0x%llX, probing for Names offset...",
+            cand.name, static_cast<unsigned long long>(enumAddr));
+
+        // Probe offsets 0x30..0x120 (step 8) for TArray<TPair<FName,int64>>
+        for (int off = 0x30; off <= 0x120; off += 8) {
+            uintptr_t data = 0;
+            int32_t count = 0;
+            if (!Mem::ReadSafe(enumAddr + off, data)) continue;
+            if (!Mem::ReadSafe(enumAddr + off + 8, count)) continue;
+
+            // Validate count range
+            if (count < cand.minCount || count > cand.maxCount) continue;
+
+            // Validate data pointer looks like heap (non-null, user-mode, not tiny)
+            if (data < 0x10000 || data > 0x7FFFFFFFFFFF) continue;
+
+            // Read first few entries and check if FNames resolve to expected substrings
+            // Each entry: TPair<FName(8 bytes), int64(8 bytes)> = 16 bytes
+            int verified = 0;
+            for (int i = 0; i < (std::min)(count, 5); ++i) {
+                uintptr_t entryAddr = data + i * 16; // UENUM_ENTRY_SIZE = 0x10
+                int32_t nameIdx = 0;
+                if (!Mem::ReadSafe(entryAddr, nameIdx)) break;
+
+                std::string entryName = FNamePool::GetString(nameIdx);
+                if (entryName.empty()) continue;
+
+                // Check for printable ASCII (basic sanity)
+                bool allAscii = true;
+                for (char c : entryName) {
+                    if (c < 0x20 || c > 0x7E) { allAscii = false; break; }
+                }
+                if (!allAscii) continue;
+
+                // Check for verification substring
+                if (entryName.find(cand.verifySubstr) != std::string::npos) {
+                    ++verified;
+                }
+            }
+
+            if (verified >= 2) {
+                DynOff::UENUM_NAMES = off;
+                DynOff::bUEnumNamesDetected.store(true, std::memory_order_release);
+
+                Logger::Info("DYNO:Enum", "  UEnum::Names detected at UEnum+0x%02X "
+                    "(verified with '%s', count=%d, %d name matches)",
+                    off, cand.name, count, verified);
+                return true;
+            }
+        }
+
+        Logger::Debug("DYNO:Enum", "  '%s' found but no valid Names offset detected", cand.name);
+    }
+
+    // Mark as failed to prevent retry storm.
+    // Without this, every EnumProperty/ByteProperty field triggers a full GObjects scan
+    // (~0.85s each), causing 25-45 second delays for classes with many enum fields.
+    DynOff::bUEnumNamesFailed.store(true, std::memory_order_release);
+    DynOff::bUEnumNamesDetected.store(true, std::memory_order_release);
+
+    Logger::Warn("DYNO:Enum", "DetectUEnumNames: FAILED — no known enums found or validated "
+        "(will not retry; enum names will show as raw values)");
+    return false;
+}
+
+} // namespace OffsetFinder
