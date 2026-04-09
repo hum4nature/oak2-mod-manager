@@ -1,0 +1,251 @@
+def _do_rewards_list_packages() -> None:
+    """Log rewards manager packages with index, Name, and RewardsDef (for glh_give_reward package <#>)."""
+    pc = get_pc()
+    if pc is None:
+        log_buf("GroundLootHelpers | rewards list packages: no player controller.")
+        return
+    mgr, attr = _find_rewards_manager_on_pc(pc)
+    if mgr is None:
+        log_buf("GroundLootHelpers | rewards list packages: no rewards manager (glh_rewards_inspect).")
+        return
+    pkgs = getattr(mgr, "packages", None)
+    if pkgs is None:
+        log_buf("GroundLootHelpers | rewards list packages: manager has no packages.")
+        return
+    try:
+        n = len(pkgs)
+    except Exception as e:
+        log_buf("GroundLootHelpers | rewards list packages: len: %s", e)
+        return
+    log_buf("GroundLootHelpers | rewards packages (PC.%s) — %s entries:", attr, n)
+    for i in range(n):
+        try:
+            entry = pkgs[i]
+            nm = getattr(entry, "Name", None)
+            rd = getattr(entry, "RewardsDef", None)
+            log_buf("GroundLootHelpers |   [%s] Name=%s  RewardsDef=%s", i, nm, rd)
+        except Exception as e:
+            log_buf("GroundLootHelpers |   [%s] (read error) %s", i, e)
+    log_buf("GroundLootHelpers | Use: glh_give_reward package <#> [all]  |  glh_list_reward_defs / glh_give_reward def <name>")
+
+
+def _do_give_reward(package_index: Optional[int], def_path: Optional[str], all_players: bool = False) -> None:
+    """
+    Experimental: GbxRewards_BlueprintFunctions GiveReward / GiveRewardAllPlayers, or package AllPlayers variant.
+    glh_give_reward package <i> [all]  |  glh_give_reward def <path> [all]
+    May require host / break progression; logs all errors.
+    """
+    try:
+        from unrealsdk.unreal import FGbxDefPtr
+    except ImportError:
+        log_buf("GroundLootHelpers | GiveReward: FGbxDefPtr not in unrealsdk.unreal; cannot wrap def.")
+        return
+    pc = get_pc()
+    if pc is None:
+        log_buf("GroundLootHelpers | GiveReward: no player controller.")
+        return
+    lib = _get_gbx_rewards_blueprint_library()
+    if lib is None:
+        log_buf("GroundLootHelpers | GiveReward: GbxRewards_BlueprintFunctions not found.")
+        return
+
+    def_u: Optional[Any] = None
+    if package_index is not None:
+        mgr, _ = _find_rewards_manager_on_pc(pc)
+        if mgr is None:
+            log_buf("GroundLootHelpers | GiveReward: no rewards manager (run glh_rewards_inspect).")
+            return
+        pkgs = getattr(mgr, "packages", None)
+        if pkgs is None:
+            log_buf("GroundLootHelpers | GiveReward: manager has no packages.")
+            return
+        try:
+            n = len(pkgs)
+        except Exception as e:
+            log_buf("GroundLootHelpers | GiveReward: packages len: %s", e)
+            return
+        if package_index < 0 or package_index >= n:
+            log_buf("GroundLootHelpers | GiveReward: package index %s out of range (len=%s).", package_index, n)
+            return
+        try:
+            entry = pkgs[package_index]
+            def_u = getattr(entry, "RewardsDef", None)
+        except Exception as e:
+            log_buf("GroundLootHelpers | GiveReward: read packages[%s]: %s", package_index, e)
+            return
+        if def_u is None:
+            log_buf("GroundLootHelpers | GiveReward: packages[%s].RewardsDef is None.", package_index)
+            return
+        log_buf(
+            "GroundLootHelpers | GiveReward: using packages[%s].RewardsDef = %s%s",
+            package_index,
+            def_u,
+            " (all players)" if all_players else "",
+        )
+    elif def_path and def_path.strip():
+        path = _normalize_nexus_reward_def_arg(def_path)
+        if not path:
+            log_buf("GroundLootHelpers | GiveReward: empty def path after normalizing Nexus reward ref.")
+            return
+        mgr_for_ref, _ = _find_rewards_manager_on_pc(pc)
+        resolved = _resolve_reward_def_object(path)
+        if resolved is None:
+            resolved = _try_make_gbx_reward_ref(lib, pc, mgr_for_ref, path)
+        if resolved is None:
+            log_buf("GroundLootHelpers | GiveReward: could not resolve def '%s' (find_object + scan + MakeGbxRewardRef).", path)
+            return
+        def_u = resolved
+        log_buf(
+            "GroundLootHelpers | GiveReward: def = %s%s",
+            def_u,
+            " (all players)" if all_players else "",
+        )
+    else:
+        log_buf("GroundLootHelpers | Usage: glh_give_reward package <index> [all]  |  glh_give_reward def <name_or_path> [all]")
+        log_buf("GroundLootHelpers | def accepts Nexus rewards'Reward_Foo' or Reward_Foo; see glh_list_reward_defs")
+        return
+
+    mgr, mgr_attr = _find_rewards_manager_on_pc(pc)
+    world = getattr(pc, "World", None)
+
+    if all_players:
+        # Package slots are WrappedStruct in Python; only RewardsDef (FGbxDefPtr) binds to C++ for GiveReward*AllPlayers.
+        ptr_all: List[Any] = []
+        if isinstance(def_u, FGbxDefPtr):
+            ptr_all.append(def_u)
+        else:
+            try:
+                ptr_all.append(FGbxDefPtr(def_u))
+            except Exception as e:
+                log_buf("GroundLootHelpers | all-players: FGbxDefPtr(def) failed (%s); will try raw def.", e)
+            ptr_all.append(def_u)
+
+        def _all_players_arg_variants(ptr: Any) -> List[Tuple[str, Tuple[Any, ...]]]:
+            vs: List[Tuple[str, Tuple[Any, ...]]] = [
+                ("ptr", (ptr,)),
+                ("ptr_pc", (ptr, pc)),
+                ("pc_ptr", (pc, ptr)),
+            ]
+            if mgr is not None:
+                vs += [
+                    ("ptr_mgr", (ptr, mgr)),
+                    ("mgr_ptr", (mgr, ptr)),
+                ]
+            if world is not None:
+                vs += [
+                    ("ptr_world", (ptr, world)),
+                    ("world_ptr", (world, ptr)),
+                ]
+            return vs
+
+        if package_index is not None:
+            give_pkg_all = getattr(lib, "GiveRewardPackageAllPlayers", None)
+            if callable(give_pkg_all):
+                for ptr in ptr_all:
+                    for order_name, args in _all_players_arg_variants(ptr):
+                        try:
+                            give_pkg_all(*args)
+                            log_buf("GroundLootHelpers | GiveRewardPackageAllPlayers OK: %s", order_name)
+                            return
+                        except TypeError as e:
+                            log_buf("GroundLootHelpers | GiveRewardPackageAllPlayers %s TypeError: %s", order_name, e)
+                        except Exception as e:
+                            log_buf("GroundLootHelpers | GiveRewardPackageAllPlayers %s: %s", order_name, e)
+                            return
+                log_buf("GroundLootHelpers | GiveRewardPackageAllPlayers: all ptr variants failed; trying GiveRewardAllPlayers.")
+
+        give_all = getattr(lib, "GiveRewardAllPlayers", None)
+        if not callable(give_all):
+            log_buf("GroundLootHelpers | GiveRewardAllPlayers: not callable.")
+            return
+        for ptr in ptr_all:
+            for order_name, args in _all_players_arg_variants(ptr):
+                try:
+                    give_all(*args)
+                    log_buf("GroundLootHelpers | GiveRewardAllPlayers OK: %s", order_name)
+                    return
+                except TypeError as e:
+                    log_buf("GroundLootHelpers | GiveRewardAllPlayers %s TypeError: %s", order_name, e)
+                except Exception as e:
+                    log_buf("GroundLootHelpers | GiveRewardAllPlayers %s: %s", order_name, e)
+                    return
+        log_buf("GroundLootHelpers | GiveRewardAllPlayers: all variants failed.")
+        return
+
+    give_fn = getattr(lib, "GiveReward", None)
+    if not callable(give_fn):
+        log_buf("GroundLootHelpers | GiveReward: not callable on library.")
+        return
+
+    contexts: List[Any] = [pc]
+    if mgr is not None:
+        contexts.append(mgr)
+
+    ptr_candidates: List[Any] = []
+    if isinstance(def_u, FGbxDefPtr):
+        ptr_candidates.append(def_u)
+    else:
+        try:
+            ptr_candidates.append(FGbxDefPtr(def_u))
+        except Exception as e:
+            log_buf("GroundLootHelpers | GiveReward: FGbxDefPtr(def) failed (%s); will try raw def UObject.", e)
+        ptr_candidates.append(def_u)
+
+    for ptr in ptr_candidates:
+        for ctx in contexts:
+            ctx_label = "PC" if ctx is pc else ("PC.%s" % (mgr_attr or "manager"))
+            for order_name, args in (
+                ("RewardDef_then_OwnerContext", (ptr, ctx)),
+                ("swapped_OwnerContext_first", (ctx, ptr)),
+            ):
+                try:
+                    give_fn(*args)
+                    log_buf("GroundLootHelpers | GiveReward OK: %s %s", order_name, ctx_label)
+                    return
+                except TypeError as e:
+                    log_buf("GroundLootHelpers | GiveReward %s %s TypeError: %s", order_name, ctx_label, e)
+                except Exception as e:
+                    log_buf("GroundLootHelpers | GiveReward %s %s: %s", order_name, ctx_label, e)
+                    return
+    log_buf("GroundLootHelpers | GiveReward: all argument orderings failed (see TypeErrors above).")
+
+
+def _cmd_rewards_list_packages(_: argparse.Namespace) -> None:
+    _do_rewards_list_packages()
+
+
+def _cmd_give_reward(args: argparse.Namespace) -> None:
+    mode = (getattr(args, "mode", None) or "").strip().lower()
+    val = getattr(args, "value", None)
+    scope_raw = getattr(args, "scope", None)
+    scope = (scope_raw or "").strip().lower()
+    if scope and scope != "all":
+        log_buf(
+            "GroundLootHelpers | glh_give_reward: unknown third argument %r (use 'all' for all players, or omit).",
+            scope_raw,
+        )
+    all_players = scope == "all"
+    if not mode:
+        _do_give_reward(None, None, False)
+        return
+    if mode == "package":
+        if val is None or str(val).strip() == "":
+            log_buf("GroundLootHelpers | glh_give_reward package <index> [all]")
+            return
+        try:
+            _do_give_reward(int(str(val).strip()), None, all_players)
+        except ValueError:
+            log_buf("GroundLootHelpers | glh_give_reward package: need integer index, got '%s'.", val)
+        return
+    if mode == "def":
+        if val is None or str(val).strip() == "":
+            log_buf("GroundLootHelpers | glh_give_reward def <find_object_path> [all]")
+            return
+        _do_give_reward(None, str(val).strip(), all_players)
+        return
+    log_buf("GroundLootHelpers | glh_give_reward: mode must be 'package' or 'def' (got '%s').", mode)
+
+
+_cmd_give_reward.add_argument("mode", nargs="?", default=None, help="package or def")
+_cmd_give_reward.add_argument("value", nargs="?", default=None, help="package index or def path for find_object")
+_cmd_give_reward.add_argument("scope", nargs="?", default=None, help="omit = local player; all = GiveRewardPackageAllPlayers / GiveRewardAllPlayers")
