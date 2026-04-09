@@ -1,0 +1,57 @@
+[package]
+name = "uextract"
+version.workspace = true
+edition.workspace = true
+description = "UE5 IoStore extractor with JSON output - parses Zen format directly"
+license.workspace = true
+
+[lib]
+name = "uextract"
+path = "src/lib.rs"
+
+[[bin]]
+name = "uextract"
+path = "src/main.rs"
+
+[dependencies]
+# Use retoc for IoStore/Zen parsing (submodule in lib/retoc)
+retoc = { git = "https://github.com/trumank/retoc" }
+
+# Use repak for traditional PAK file reading
+repak = { git = "https://github.com/trumank/repak.git", version = "0.2.2", features = ["oodle"] }
+
+# Use usmap for property schema parsing (submodule in lib/jmap)
+usmap = { git = "https://github.com/trumank/jmap" }
+
+# Directory walking
+walkdir = "2"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Glob patterns
+glob-match = "0.2"
+
+# Error handling
+anyhow = "1"
+
+# Progress
+indicatif = "0.17"
+
+# Parallel processing
+rayon = "1"
+
+# Texture extraction
+texture2ddecoder = "0.1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+byteorder = "1"
+
+[dev-dependencies]
+dirs = "6"
+
+[lints]
+workspace = true

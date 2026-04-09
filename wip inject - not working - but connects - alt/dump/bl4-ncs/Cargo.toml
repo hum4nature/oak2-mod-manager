@@ -1,0 +1,40 @@
+[package]
+name = "bl4-ncs"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NCS (Nexus Config Store) parser for Borderlands 4"
+
+[dependencies]
+# Oodle decompression (pure Rust implementation)
+oozextract = "0.5"
+
+# Binary parsing
+byteorder = "1.5"
+memchr = "2.7"
+
+# Error handling
+thiserror.workspace = true
+
+# Serialization (for parsed content)
+serde.workspace = true
+serde_json.workspace = true
+
+# Directory walking
+walkdir = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["libloaderapi"] }
+
+[dev-dependencies]
+anyhow = "1"
+dirs = "6"
+
+[lints]
+workspace = true

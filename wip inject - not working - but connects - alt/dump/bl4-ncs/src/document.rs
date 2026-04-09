@@ -1,0 +1,622 @@
+//! Unified document types for parsed NCS data
+//!
+//! These types represent the output of the NCS table data decoder.
+//! Each NCS file contains one or more named tables, each containing
+//! records with entries and optional dependency entries.
+
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+/// Parsed NCS document containing all tables from a single NCS file
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Document {
+    pub tables: HashMap<String, Table>,
+}
+
+/// A single table with dependency references and records
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Table {
+    pub name: String,
+    pub deps: Vec<String>,
+    pub records: Vec<Record>,
+}
+
+/// A record containing entries decoded from the binary section
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Record {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<Tag>,
+    pub entries: Vec<Entry>,
+}
+
+/// An entry with a key, fields map, and optional dependency entries
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Entry {
+    pub key: String,
+    pub value: Value,
+    pub dep_entries: Vec<DepEntry>,
+}
+
+/// A dependency entry linking to another table
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DepEntry {
+    pub dep_table_name: String,
+    pub dep_index: u32,
+    pub key: String,
+    pub value: Value,
+}
+
+/// Value types produced by decode_node
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Value {
+    Null,
+    Leaf(String),
+    Array(Vec<Value>),
+    Map(HashMap<String, Value>),
+    Ref { r#ref: String },
+}
+
+/// Record tag metadata from the tags section preceding entries
+///
+/// Tags carry per-record metadata like key names, numeric values,
+/// name lists, and inline variant nodes. Tags are stored separately
+/// from entries for round-trip fidelity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "__tag")]
+pub enum Tag {
+    #[serde(rename = "a")]
+    KeyName { pair: String },
+    #[serde(rename = "b")]
+    U32 { value: u32 },
+    #[serde(rename = "c")]
+    F32 { u32_value: u32, f32_value: f32 },
+    #[serde(rename = "d")]
+    NameListD { list: Vec<String> },
+    #[serde(rename = "e")]
+    NameListE { list: Vec<String> },
+    #[serde(rename = "f")]
+    NameListF { list: Vec<String> },
+    #[serde(rename = "p")]
+    Variant { variant: Value },
+}
+
+/// Serial index entry extracted from parsed data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SerialIndexEntry {
+    pub table_name: String,
+    pub dep_table: String,
+    pub part_name: String,
+    pub index: u32,
+}
+
+/// A part entry with category context for the parts database
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CategorizedPart {
+    pub category: u32,
+    pub index: u32,
+    pub name: String,
+}
+
+/// A cross-category part from a named dependency table
+///
+/// These parts (elements, stat mods, rarity components, etc.) are shared
+/// across all item categories rather than belonging to a single category.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedPart {
+    pub dep_table: String,
+    pub index: u32,
+    pub name: String,
+}
+
+/// Extract parts grouped by category from a parsed document
+///
+/// Each entry with a serialindex defines a category (the serialindex IS the
+/// category ID). The entry's dep_entries are the parts in that category,
+/// with each dep_entry's serialindex as the part index.
+///
+/// Extension records (same key, no serialindex) contribute additional parts
+/// to the category established in a root record. This captures legendary
+/// barrels, comp_05_legendary identifiers, and other extension-only parts.
+pub fn extract_categorized_parts(doc: &Document) -> Vec<CategorizedPart> {
+    let category_keys = build_category_key_map(doc);
+    let mut results = Vec::new();
+
+    for table in doc.tables.values() {
+        for record in &table.records {
+            for entry in &record.entries {
+                let category = if let Some(cat) = extract_index_from_value(&entry.value) {
+                    cat
+                } else if let Some(&cat) = category_keys.get(&entry.key) {
+                    cat
+                } else {
+                    continue;
+                };
+
+                for dep_entry in &entry.dep_entries {
+                    if let Some(index) = extract_index_from_value(&dep_entry.value) {
+                        results.push(CategorizedPart {
+                            category,
+                            index,
+                            name: dep_entry.key.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    results
+}
+
+/// Extract category ID → NCS entry key name mapping from a parsed document
+///
+/// Only includes entries that have dep_entries with serial indices (actual
+/// parts), avoiding cosmetic/metadata entries that reuse the same ID space.
+/// First-seen name wins when multiple entries share a category ID.
+pub fn extract_category_names(doc: &Document) -> HashMap<u32, String> {
+    let mut names = HashMap::new();
+
+    for table in doc.tables.values() {
+        for record in &table.records {
+            for entry in &record.entries {
+                let Some(category) = extract_index_from_value(&entry.value) else {
+                    continue;
+                };
+
+                let has_parts = entry
+                    .dep_entries
+                    .iter()
+                    .any(|de| extract_index_from_value(&de.value).is_some());
+                if !has_parts {
+                    continue;
+                }
+
+                names.entry(category).or_insert_with(|| entry.key.clone());
+            }
+        }
+    }
+
+    names
+}
+
+/// Extract ALL entry names with serial indices, including those without parts
+///
+/// Unlike `extract_category_names` which only includes entries with parts,
+/// this captures every entry that has a serialindex. Useful for naming
+/// quest items, pickups, and other non-modular items.
+/// Callers should be aware that inv_custom files reuse the same index space
+/// with different semantics (cosmetics vs gameplay items).
+pub fn extract_all_entry_names(doc: &Document) -> HashMap<u32, String> {
+    let mut names = HashMap::new();
+
+    for table in doc.tables.values() {
+        for record in &table.records {
+            for entry in &record.entries {
+                if let Some(index) = extract_index_from_value(&entry.value) {
+                    names.entry(index).or_insert_with(|| entry.key.clone());
+                }
+            }
+        }
+    }
+
+    names
+}
+
+/// Extract cross-category shared parts from named dependency tables
+///
+/// Parts in dep tables like "element", "stat_group2", "stat_group3", etc.
+/// are shared across all item categories. They come from extension entries
+/// (no serialindex) whose dep_entries reference named dep tables.
+///
+/// Note: extension entries may also contribute per-category parts (captured
+/// by `extract_categorized_parts`). The overlap is intentional — the decoder
+/// uses per-category lookup first, with shared parts as fallback.
+pub fn extract_shared_parts(doc: &Document) -> Vec<SharedPart> {
+    let mut results = Vec::new();
+
+    for table in doc.tables.values() {
+        for record in &table.records {
+            for entry in &record.entries {
+                if extract_index_from_value(&entry.value).is_some() {
+                    continue;
+                }
+
+                for dep_entry in &entry.dep_entries {
+                    if dep_entry.dep_table_name.is_empty() {
+                        continue;
+                    }
+                    if let Some(index) = extract_index_from_value(&dep_entry.value) {
+                        results.push(SharedPart {
+                            dep_table: dep_entry.dep_table_name.clone(),
+                            index,
+                            name: dep_entry.key.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    results
+}
+
+/// Extract serial indices from a parsed document
+///
+/// Looks for entries and dep_entries containing "serialindex" fields
+/// with numeric index values.
+pub fn extract_serial_indices(doc: &Document) -> Vec<SerialIndexEntry> {
+    let mut results = Vec::new();
+
+    for (table_name, table) in &doc.tables {
+        for record in &table.records {
+            for entry in &record.entries {
+                if let Some(index) = extract_index_from_value(&entry.value) {
+                    results.push(SerialIndexEntry {
+                        table_name: table_name.clone(),
+                        dep_table: String::new(),
+                        part_name: entry.key.clone(),
+                        index,
+                    });
+                }
+
+                for dep_entry in &entry.dep_entries {
+                    if let Some(index) = extract_index_from_value(&dep_entry.value) {
+                        results.push(SerialIndexEntry {
+                            table_name: table_name.clone(),
+                            dep_table: dep_entry.dep_table_name.clone(),
+                            part_name: dep_entry.key.clone(),
+                            index,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    results
+}
+
+/// Build a map from entry key → category ID for entries that have a serialindex.
+///
+/// Used to resolve extension records (same key, no serialindex) back to
+/// their category. First-seen category wins per key.
+fn build_category_key_map(doc: &Document) -> HashMap<String, u32> {
+    let mut map = HashMap::new();
+    for table in doc.tables.values() {
+        for record in &table.records {
+            for entry in &record.entries {
+                if let Some(category) = extract_index_from_value(&entry.value) {
+                    map.entry(entry.key.clone()).or_insert(category);
+                }
+            }
+        }
+    }
+    map
+}
+
+fn extract_index_from_value(value: &Value) -> Option<u32> {
+    match value {
+        Value::Map(map) => {
+            if let Some(si_value) = map.get("serialindex") {
+                return extract_index_from_serialindex(si_value);
+            }
+            for v in map.values() {
+                if let Some(idx) = extract_index_from_value(v) {
+                    return Some(idx);
+                }
+            }
+            None
+        }
+        Value::Array(arr) => {
+            for v in arr {
+                if let Some(idx) = extract_index_from_value(v) {
+                    return Some(idx);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn extract_index_from_serialindex(value: &Value) -> Option<u32> {
+    match value {
+        Value::Map(map) => {
+            if let Some(Value::Leaf(idx_str)) = map.get("index") {
+                let clean = if let Some(pos) = idx_str.find('\'') {
+                    let end = idx_str.rfind('\'').unwrap_or(idx_str.len());
+                    &idx_str[pos + 1..end]
+                } else {
+                    idx_str.as_str()
+                };
+                clean.parse().ok()
+            } else {
+                None
+            }
+        }
+        Value::Leaf(s) => {
+            let clean = if let Some(pos) = s.find('\'') {
+                let end = s.rfind('\'').unwrap_or(s.len());
+                &s[pos + 1..end]
+            } else {
+                s.as_str()
+            };
+            clean.parse().ok()
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_value_serialization() {
+        let leaf = Value::Leaf("hello".to_string());
+        let json = serde_json::to_string(&leaf).unwrap();
+        assert_eq!(json, "\"hello\"");
+
+        let null = Value::Null;
+        let json = serde_json::to_string(&null).unwrap();
+        assert_eq!(json, "null");
+
+        let arr = Value::Array(vec![
+            Value::Leaf("a".to_string()),
+            Value::Leaf("b".to_string()),
+        ]);
+        let json = serde_json::to_string(&arr).unwrap();
+        assert_eq!(json, "[\"a\",\"b\"]");
+    }
+
+    #[test]
+    fn test_extract_serial_index() {
+        let mut si_map = HashMap::new();
+        si_map.insert("index".to_string(), Value::Leaf("42".to_string()));
+        si_map.insert("status".to_string(), Value::Leaf("Active".to_string()));
+
+        let mut entry_map = HashMap::new();
+        entry_map.insert("serialindex".to_string(), Value::Map(si_map));
+
+        let result = extract_index_from_value(&Value::Map(entry_map));
+        assert_eq!(result, Some(42));
+    }
+
+    #[test]
+    fn test_extract_typed_serial_index() {
+        let mut si_map = HashMap::new();
+        si_map.insert("index".to_string(), Value::Leaf("int'237'".to_string()));
+
+        let mut entry_map = HashMap::new();
+        entry_map.insert("serialindex".to_string(), Value::Map(si_map));
+
+        let result = extract_index_from_value(&Value::Map(entry_map));
+        assert_eq!(result, Some(237));
+    }
+
+    #[test]
+    fn test_tag_serialization() {
+        let tag_a = Tag::KeyName {
+            pair: "test_key".to_string(),
+        };
+        let json = serde_json::to_string(&tag_a).unwrap();
+        assert!(json.contains("\"__tag\":\"a\""));
+        assert!(json.contains("\"pair\":\"test_key\""));
+
+        let tag_b = Tag::U32 { value: 42 };
+        let json = serde_json::to_string(&tag_b).unwrap();
+        assert!(json.contains("\"__tag\":\"b\""));
+        assert!(json.contains("\"value\":42"));
+
+        let tag_c = Tag::F32 {
+            u32_value: 1065353216,
+            f32_value: 1.0,
+        };
+        let json = serde_json::to_string(&tag_c).unwrap();
+        assert!(json.contains("\"__tag\":\"c\""));
+        assert!(json.contains("\"u32_value\":1065353216"));
+        assert!(json.contains("\"f32_value\":1.0"));
+
+        let tag_d = Tag::NameListD {
+            list: vec!["name1".to_string(), "name2".to_string()],
+        };
+        let json = serde_json::to_string(&tag_d).unwrap();
+        assert!(json.contains("\"__tag\":\"d\""));
+        assert!(json.contains("\"list\":[\"name1\",\"name2\"]"));
+    }
+
+    #[test]
+    fn test_tag_deserialization_roundtrip() {
+        let tags = vec![
+            Tag::KeyName {
+                pair: "test".to_string(),
+            },
+            Tag::U32 { value: 99 },
+            Tag::F32 {
+                u32_value: 0x3F800000,
+                f32_value: 1.0,
+            },
+            Tag::NameListD {
+                list: vec!["a".to_string(), "b".to_string()],
+            },
+            Tag::NameListE {
+                list: vec!["x".to_string()],
+            },
+            Tag::NameListF { list: vec![] },
+            Tag::Variant {
+                variant: Value::Leaf("val".to_string()),
+            },
+        ];
+
+        for tag in &tags {
+            let json = serde_json::to_string(tag).unwrap();
+            let roundtrip: Tag = serde_json::from_str(&json).unwrap();
+            let json2 = serde_json::to_string(&roundtrip).unwrap();
+            assert_eq!(json, json2);
+        }
+    }
+
+    #[test]
+    fn test_value_deserialization_roundtrip() {
+        let values = vec![
+            Value::Null,
+            Value::Leaf("hello".to_string()),
+            Value::Array(vec![Value::Leaf("a".to_string()), Value::Null]),
+            Value::Ref {
+                r#ref: "some_ref".to_string(),
+            },
+        ];
+
+        for val in &values {
+            let json = serde_json::to_string(val).unwrap();
+            let roundtrip: Value = serde_json::from_str(&json).unwrap();
+            let json2 = serde_json::to_string(&roundtrip).unwrap();
+            assert_eq!(json, json2);
+        }
+    }
+
+    #[test]
+    fn test_extract_serial_indices_from_dep_entries() {
+        let mut si_map = HashMap::new();
+        si_map.insert("index".to_string(), Value::Leaf("5".to_string()));
+
+        let doc = Document {
+            tables: HashMap::from([(
+                "test_table".to_string(),
+                Table {
+                    name: "test_table".to_string(),
+                    deps: vec!["dep_table".to_string()],
+                    records: vec![Record {
+                        tags: vec![],
+                        entries: vec![Entry {
+                            key: "main_key".to_string(),
+                            value: Value::Null,
+                            dep_entries: vec![DepEntry {
+                                dep_table_name: "dep_table".to_string(),
+                                dep_index: 0,
+                                key: "dep_key".to_string(),
+                                value: Value::Map({
+                                    let mut m = HashMap::new();
+                                    m.insert("serialindex".to_string(), Value::Map(si_map.clone()));
+                                    m
+                                }),
+                            }],
+                        }],
+                    }],
+                },
+            )]),
+        };
+
+        let indices = extract_serial_indices(&doc);
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].part_name, "dep_key");
+        assert_eq!(indices[0].index, 5);
+        assert_eq!(indices[0].dep_table, "dep_table");
+    }
+
+    fn make_serialindex_value(index: u32) -> Value {
+        Value::Map(HashMap::from([(
+            "serialindex".to_string(),
+            Value::Map(HashMap::from([(
+                "index".to_string(),
+                Value::Leaf(index.to_string()),
+            )])),
+        )]))
+    }
+
+    #[test]
+    fn test_extension_records_merge_into_category() {
+        let doc = Document {
+            tables: HashMap::from([(
+                "inv".to_string(),
+                Table {
+                    name: "inv".to_string(),
+                    deps: vec!["inv_comp".to_string()],
+                    records: vec![
+                        Record {
+                            tags: vec![],
+                            entries: vec![Entry {
+                                key: "jak_ps".to_string(),
+                                value: make_serialindex_value(3),
+                                dep_entries: vec![DepEntry {
+                                    dep_table_name: "barrel".to_string(),
+                                    dep_index: 0,
+                                    key: "part_barrel_01".to_string(),
+                                    value: make_serialindex_value(7),
+                                }],
+                            }],
+                        },
+                        Record {
+                            tags: vec![],
+                            entries: vec![Entry {
+                                key: "jak_ps".to_string(),
+                                value: Value::Null,
+                                dep_entries: vec![
+                                    DepEntry {
+                                        dep_table_name: "barrel".to_string(),
+                                        dep_index: 0,
+                                        key: "part_barrel_quickdraw".to_string(),
+                                        value: make_serialindex_value(72),
+                                    },
+                                    DepEntry {
+                                        dep_table_name: "element".to_string(),
+                                        dep_index: 0,
+                                        key: "element_fire".to_string(),
+                                        value: make_serialindex_value(98),
+                                    },
+                                ],
+                            }],
+                        },
+                    ],
+                },
+            )]),
+        };
+
+        let parts = extract_categorized_parts(&doc);
+        assert_eq!(parts.len(), 3);
+        assert!(parts.iter().all(|p| p.category == 3));
+        assert!(parts
+            .iter()
+            .any(|p| p.name == "part_barrel_01" && p.index == 7));
+        assert!(parts
+            .iter()
+            .any(|p| p.name == "part_barrel_quickdraw" && p.index == 72));
+        assert!(parts
+            .iter()
+            .any(|p| p.name == "element_fire" && p.index == 98));
+
+        let shared = extract_shared_parts(&doc);
+        assert_eq!(
+            shared.len(),
+            2,
+            "extension dep_table entries should appear as shared"
+        );
+        assert!(shared
+            .iter()
+            .any(|p| p.dep_table == "barrel" && p.name == "part_barrel_quickdraw"));
+        assert!(shared
+            .iter()
+            .any(|p| p.dep_table == "element" && p.name == "element_fire"));
+    }
+
+    #[test]
+    fn test_record_tags_skip_empty() {
+        let record = Record {
+            tags: vec![],
+            entries: vec![],
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(!json.contains("tags"), "empty tags should be omitted");
+
+        let record_with_tags = Record {
+            tags: vec![Tag::U32 { value: 1 }],
+            entries: vec![],
+        };
+        let json = serde_json::to_string(&record_with_tags).unwrap();
+        assert!(
+            json.contains("\"tags\""),
+            "non-empty tags should be present"
+        );
+    }
+}
