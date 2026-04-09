@@ -1,0 +1,130 @@
+//! Save command CLI definitions
+
+use clap::{Args, Subcommand};
+use std::path::PathBuf;
+
+#[derive(Args)]
+pub struct SaveArgs {
+    /// Path to .sav file
+    pub input: PathBuf,
+
+    /// Reveal or clear the fog-of-discovery map
+    #[arg(long, value_name = "ACTION")]
+    pub map: Option<MapAction>,
+
+    /// Only affect a specific zone (with --map)
+    #[arg(long, requires = "map")]
+    pub zone: Option<String>,
+
+    /// Validate all items in the save file
+    #[arg(long)]
+    pub validate_items: bool,
+
+    /// Set all items to a specific level
+    #[arg(long)]
+    pub set_item_level: Option<u8>,
+
+    /// Steam ID (uses configured default if not provided)
+    #[arg(short, long)]
+    pub steam_id: Option<String>,
+
+    /// Create backup before modifying
+    #[arg(short, long, default_value_t = true)]
+    pub backup: bool,
+
+    #[command(subcommand)]
+    pub action: Option<SaveAction>,
+}
+
+#[derive(Clone, clap::ValueEnum)]
+pub enum MapAction {
+    Reveal,
+    Clear,
+}
+
+#[derive(Subcommand)]
+pub enum SaveAction {
+    /// Decrypt to YAML (stdout or -o file)
+    Decrypt {
+        /// Path to output YAML file (uses stdout if not specified)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+
+    /// Encrypt from YAML (positional file or stdin) to .sav
+    Encrypt {
+        /// YAML input file (reads stdin if not provided)
+        yaml: Option<PathBuf>,
+    },
+
+    /// Edit in $EDITOR
+    Edit,
+
+    /// Query values
+    Get {
+        /// YAML path query (e.g. "state.currencies.cash")
+        query: Option<String>,
+
+        /// Show character level and XP
+        #[arg(long)]
+        level: bool,
+
+        /// Show currency (cash, eridium)
+        #[arg(long)]
+        money: bool,
+
+        /// Show character info (name, class, difficulty)
+        #[arg(long)]
+        info: bool,
+
+        /// Show all available data
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Set a value
+    Set {
+        /// YAML path to modify (e.g. "state.currencies.cash")
+        path: String,
+
+        /// Value to set (auto-detects numbers vs strings, unless --raw is used)
+        value: String,
+
+        /// Treat value as raw YAML (for complex/unknown structures)
+        #[arg(short, long)]
+        raw: bool,
+    },
+
+    /// Mission progression commands
+    Missions {
+        #[command(subcommand)]
+        action: MissionsAction,
+    },
+
+    /// Campaign progression commands (alias for missions)
+    #[command(hide = true)]
+    Campaign {
+        #[command(subcommand)]
+        action: MissionsAction,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+pub enum MissionsAction {
+    /// List missions with completion status
+    List {
+        /// Filter by category (main, dlc, side, micro, vault, all)
+        #[arg(default_value = "main")]
+        category: String,
+    },
+
+    /// Set campaign progress to a specific mission
+    Set {
+        /// Mission name (e.g. "grasslands1", "mountains2a", "searchforlilith")
+        mission: String,
+
+        /// Skip confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+}

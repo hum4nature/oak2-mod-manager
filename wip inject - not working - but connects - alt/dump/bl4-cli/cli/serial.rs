@@ -1,0 +1,147 @@
+//! Serial command CLI definitions
+
+use clap::Subcommand;
+use std::path::PathBuf;
+
+#[derive(Subcommand)]
+pub enum SerialCommand {
+    /// Decode an item serial number
+    Decode {
+        /// Item serial to decode (e.g. @Ugr$ZCm/&tH!t{KgK/Shxu>k)
+        serial: String,
+
+        /// Show detailed byte-by-byte breakdown
+        #[arg(short, long)]
+        verbose: bool,
+
+        /// Show bit-by-bit parsing debug output
+        #[arg(short, long)]
+        debug: bool,
+
+        /// Analyze first token bit structure for group ID research
+        #[arg(short, long)]
+        analyze: bool,
+
+        /// Show rarity estimation (drop probability, pool size, odds)
+        #[arg(short, long)]
+        rarity: bool,
+
+        /// Compact single-line parts output
+        #[arg(short = 's', long)]
+        short: bool,
+
+        /// Path to parts database (directory of per-category TSVs or single file)
+        #[arg(long, default_value = "share/manifest/parts")]
+        parts_db: PathBuf,
+
+        /// Remove a part by name (repeatable)
+        #[arg(long, action = clap::ArgAction::Append)]
+        remove: Vec<String>,
+
+        /// Add a part by name (repeatable)
+        #[arg(long, action = clap::ArgAction::Append)]
+        add: Vec<String>,
+
+        /// Set item level
+        #[arg(long)]
+        level: Option<u8>,
+    },
+
+    /// Re-encode a serial (for testing round-trip encoding)
+    Encode {
+        /// Item serial to decode and re-encode
+        serial: String,
+    },
+
+    /// Compare two item serials side by side
+    Compare {
+        /// First serial
+        serial1: String,
+
+        /// Second serial
+        serial2: String,
+    },
+
+    /// Modify a serial by swapping parts from another serial
+    Modify {
+        /// Base serial to modify
+        base: String,
+
+        /// Source serial to take parts from
+        source: String,
+
+        /// Part indices to copy from source (e.g. "4,12" for body and barrel)
+        parts: String,
+    },
+
+    /// Validate item serial(s) for legality
+    Validate {
+        /// Item serial(s) to validate
+        serials: Vec<String>,
+
+        /// Show detailed check results
+        #[arg(short, long)]
+        verbose: bool,
+    },
+
+    /// View or modify class mod skills
+    Skills {
+        /// Class mod serial to inspect/modify
+        serial: String,
+
+        /// List all available skills for this class mod
+        #[arg(short, long)]
+        list: bool,
+
+        /// Filter --list to red tree skills
+        #[arg(long)]
+        red: bool,
+
+        /// Filter --list to green tree skills
+        #[arg(long)]
+        green: bool,
+
+        /// Filter --list to blue tree skills
+        #[arg(long)]
+        blue: bool,
+
+        /// Add a skill: 'Name@Tier' (repeatable)
+        #[arg(long, action = clap::ArgAction::Append)]
+        add: Vec<String>,
+
+        /// Remove a skill by name (repeatable)
+        #[arg(long, action = clap::ArgAction::Append)]
+        remove: Vec<String>,
+
+        /// Skip validation and confirmation
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// View or modify equipment firmware
+    Firmware {
+        /// Item serial to inspect/modify
+        serial: String,
+
+        /// List available firmware for this item type
+        #[arg(short, long)]
+        list: bool,
+
+        /// Set firmware by name (e.g., 'deadeye', 'heating_up')
+        #[arg(long)]
+        set: Option<String>,
+
+        /// Skip confirmation
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Batch decode serials from a file to binary output
+    BatchDecode {
+        /// Input file with one serial per line
+        input: PathBuf,
+
+        /// Output binary file (length-prefixed records)
+        output: PathBuf,
+    },
+}

@@ -1,0 +1,21 @@
+//! Command handlers for bl4 CLI
+//!
+//! Each subcommand has its own module with handler functions.
+
+pub mod campaign;
+pub mod configure;
+pub mod drops;
+pub mod items_db;
+pub mod launch;
+pub mod memory;
+pub mod ncs;
+pub mod parts;
+pub mod save;
+pub mod serial;
+
+#[cfg(feature = "research")]
+pub mod extract;
+#[cfg(feature = "research")]
+pub mod manifest;
+#[cfg(feature = "research")]
+pub mod usmap;
